@@ -9,10 +9,19 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.security.SecureRandom
 import java.util.UUID
 
 data class Msg(val id: String, val senderId: String, val senderName: String, val text: String, val ts: Long)
-data class RoomInfo(val code: String, val password: String, val name: String)
+
+/** created = true when this phone built the room (UI only; the network treats everyone equally). */
+data class RoomInfo(val code: String, val password: String, val name: String, val created: Boolean = false)
+
+object RoomCodes {
+    private val words = listOf("COG", "GEAR", "PISTON", "VALVE", "BOILER", "STEAM", "BRASS", "RIVET", "SPROCKET", "ZEPPELIN")
+    private val rng = SecureRandom()
+    fun generate(): String = "${words[rng.nextInt(words.size)]}-${1000 + rng.nextInt(9000)}"
+}
 
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val prefs = Identity.securePrefs(app)
@@ -31,7 +40,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val code = prefs.getString("room_code", null)
         val pw = prefs.getString("room_pw", null)
         val name = prefs.getString("name", null)
-        if (code != null && pw != null && name != null) join(RoomInfo(code, pw, name))
+        if (code != null && pw != null && name != null) {
+            join(RoomInfo(code, pw, name, prefs.getBoolean("room_created", false)))
+        }
     }
 
     fun join(r: RoomInfo) {
@@ -43,7 +54,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             t.start(myId, Crypto.roomTag(r.code), key, ::onFrame) { peers.value = it }
             transport = t
             prefs.edit().putString("room_code", r.code).putString("room_pw", r.password)
-                .putString("name", r.name).apply()
+                .putString("name", r.name).putBoolean("room_created", r.created).apply()
             room.value = r
             joining.value = false
         }
@@ -51,7 +62,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun leave() {
         transport?.stop(); transport = null
-        prefs.edit().remove("room_code").remove("room_pw").apply()
+        prefs.edit().remove("room_code").remove("room_pw").remove("room_created").apply()
         room.value = null; messages.value = emptyList(); peers.value = 0; seen.clear()
     }
 
