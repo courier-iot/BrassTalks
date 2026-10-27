@@ -11,12 +11,17 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Voice notes -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
     <!-- allowBackup=false so a restored backup can never clone one install's ID onto another -->
     <application
         android:name=".BrassApp"
         android:allowBackup="false"
         android:label="BrassTalks"
-        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:theme="@style/Theme.BrassTalks">
 
         <service
             android:name=".SessionService"
