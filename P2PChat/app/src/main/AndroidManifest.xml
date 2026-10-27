@@ -8,7 +8,7 @@
     <!-- allowBackup=false so a restored backup can never clone one install's ID onto another -->
     <application
         android:allowBackup="false"
-        android:label="P2P Chat"
+        android:label="BrassTalks"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <activity
             android:name=".MainActivity"
