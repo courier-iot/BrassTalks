@@ -35,8 +35,8 @@ object Notifier {
     fun ensureChannels(ctx: Context) {
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(
-            NotificationChannel(CH_SESSION, "Room connection", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "Shown while BrassTalks keeps your room connected"
+            NotificationChannel(CH_SESSION, "Carriage connection", NotificationManager.IMPORTANCE_LOW).apply {
+                description = "Shown while BrassTalks keeps your carriages connected"
             })
         nm.createNotificationChannel(
             NotificationChannel(CH_MESSAGES, "Messages", NotificationManager.IMPORTANCE_DEFAULT).apply {
@@ -50,27 +50,20 @@ object Notifier {
         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
     )
 
-    fun session(ctx: Context, text: String): Notification {
-        val leave = PendingIntent.getService(
-            ctx, 1,
-            Intent(ctx, SessionService::class.java).setAction(SessionService.ACTION_LEAVE),
-            PendingIntent.FLAG_IMMUTABLE
-        )
-        return NotificationCompat.Builder(ctx, CH_SESSION)
+    fun session(ctx: Context, text: String): Notification =
+        NotificationCompat.Builder(ctx, CH_SESSION)
             .setSmallIcon(android.R.drawable.stat_notify_chat)
             .setContentTitle("BrassTalks")
             .setContentText(text)
             .setContentIntent(openApp(ctx))
-            .addAction(0, "Leave room", leave)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
-    }
 
     @Synchronized
-    fun message(ctx: Context, sender: String, text: String) {
+    fun message(ctx: Context, carriage: String, sender: String, text: String) {
         unread++
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val hidden = NotificationCompat.Builder(ctx, CH_MESSAGES)
@@ -80,7 +73,7 @@ object Notifier {
             .build()
         val n = NotificationCompat.Builder(ctx, CH_MESSAGES)
             .setSmallIcon(android.R.drawable.stat_notify_chat)
-            .setContentTitle(if (unread == 1) sender else "$unread new messages")
+            .setContentTitle(if (unread == 1) "$sender · $carriage" else "$unread new messages")
             .setContentText(if (unread == 1) text else "Latest from $sender")
             .setStyle(NotificationCompat.BigTextStyle().bigText(text))
             .setContentIntent(openApp(ctx))
@@ -101,7 +94,7 @@ object Notifier {
 /**
  * Foreground service: keeps BrassTalks alive and connected while the screen is off or the app is in the
  * background. Holds a CPU wake lock and a WiFi lock so heartbeats keep flowing. If Android ever kills it,
- * START_STICKY brings it back and the saved room is rejoined automatically.
+ * START_STICKY brings it back and your saved carriages are rejoined automatically.
  */
 class SessionService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -128,12 +121,7 @@ class SessionService : Service() {
             return START_NOT_STICKY
         }
 
-        val vm = (application as BrassApp).chatVm()   // also restores the saved room if the app was restarted
-        if (intent?.action == ACTION_LEAVE) {
-            vm.leave(false)
-            stopSelf()
-            return START_NOT_STICKY
-        }
+        val vm = (application as BrassApp).chatVm()   // also restores saved carriages if the app was restarted
         if (!vm.wantsSession()) {
             stopSelf()
             return START_NOT_STICKY
@@ -143,11 +131,13 @@ class SessionService : Service() {
         if (!collecting) {
             collecting = true
             scope.launch {
-                combine(vm.room, vm.peers, vm.joining) { r, p, j -> Triple(r, p, j) }.collect { (r, p, j) ->
-                    if (r == null && !j) {
+                combine(vm.status, vm.joining) { st, j -> st to j }.collect { (st, j) ->
+                    val count = st.first
+                    val others = st.second
+                    if (count == 0 && !j) {
                         stopSelf()
-                    } else if (r != null) {
-                        val text = "Room ${r.code} · ${p + 1} of ${Limits.MAX_ROOM} aboard"
+                    } else if (count > 0) {
+                        val text = (if (count == 1) "1 carriage" else "$count carriages") + " · $others connected"
                         (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
                             .notify(NOTIF_ID, Notifier.session(this@SessionService, text))
                     }
@@ -181,7 +171,6 @@ class SessionService : Service() {
     }
 
     companion object {
-        const val ACTION_LEAVE = "com.example.p2pchat.LEAVE"
         private const val NOTIF_ID = 1
         @Volatile var running = false
 

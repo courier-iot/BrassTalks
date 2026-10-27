@@ -54,7 +54,8 @@ class HistoryStore(context: Context) {
         val arr = JSONArray()
         msgs.filter { it.ts >= limit }.forEach { m ->
             arr.put(JSONObject().put("id", m.id).put("sid", m.senderId).put("n", m.senderName)
-                .put("text", m.text).put("ts", m.ts).put("sys", m.system))
+                .put("text", m.text).put("ts", m.ts).put("sys", m.system)
+                .put("img", m.image ?: "").put("w", m.imgW).put("h", m.imgH))
         }
         val f = file(tag)
         f.delete() // EncryptedFile refuses to overwrite
@@ -71,7 +72,8 @@ class HistoryStore(context: Context) {
             val limit = cutoff(retentionDays)
             (0 until arr.length()).map { arr.getJSONObject(it) }.map {
                 Msg(it.getString("id"), it.getString("sid"), it.getString("n"),
-                    it.getString("text"), it.getLong("ts"), it.optBoolean("sys", false))
+                    it.getString("text"), it.getLong("ts"), it.optBoolean("sys", false),
+                    it.optString("img", "").ifEmpty { null }, it.optInt("w", 0), it.optInt("h", 0))
             }.filter { it.ts >= limit }
         } catch (e: Exception) { emptyList() }
     }

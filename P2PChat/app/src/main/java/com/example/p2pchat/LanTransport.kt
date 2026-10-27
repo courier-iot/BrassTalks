@@ -6,6 +6,8 @@ import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.InetSocketAddress
@@ -35,6 +37,7 @@ class LanTransport(context: Context) : Transport {
     private val dialing = ConcurrentHashMap.newKeySet<String>()
     private val banned = ConcurrentHashMap.newKeySet<String>()
     private val resolveQueue = Channel<NsdServiceInfo>(Channel.UNLIMITED)
+    private val tries = ConcurrentHashMap<String, Int>()
     private val ring = CopyOnWriteArrayList<Pair<String, SecretKey>>()   // (kid, key), newest first
     @Volatile private var graceUntil = 0L
 
@@ -108,13 +111,15 @@ class LanTransport(context: Context) : Transport {
         // NSD resolves one service at a time
         scope.launch {
             for (found in resolveQueue) {
-                val done = CompletableDeferred<NsdServiceInfo?>()
-                @Suppress("DEPRECATION")
-                nsd.resolveService(found, object : NsdManager.ResolveListener {
-                    override fun onResolveFailed(i: NsdServiceInfo, e: Int) { done.complete(null) }
-                    override fun onServiceResolved(i: NsdServiceInfo) { done.complete(i) }
-                })
-                val r = withTimeoutOrNull(5000) { done.await() } ?: continue
+                val r = resolveOne(found)
+                if (r == null) {
+                    // Another carriage may have been resolving at the same moment: try again shortly
+                    val n = (tries[found.serviceName] ?: 0) + 1
+                    tries[found.serviceName] = n
+                    if (n < 4) launch { delay(1500); resolveQueue.trySend(found) }
+                    continue
+                }
+                tries.remove(found.serviceName)
                 val id = peerIdOf(r.serviceName) ?: continue
                 if (banned.contains(id)) continue
                 @Suppress("DEPRECATION")
@@ -128,6 +133,17 @@ class LanTransport(context: Context) : Transport {
         scope.launch {
             while (isActive) { delay(10_000); writeAll(Crypto.encrypt(ring[0].second, PING)) }
         }
+    }
+
+    /** Android allows one lookup at a time for the whole app, so all carriages share one lock. */
+    private suspend fun resolveOne(found: NsdServiceInfo): NsdServiceInfo? = resolveLock.withLock {
+        val done = CompletableDeferred<NsdServiceInfo?>()
+        @Suppress("DEPRECATION")
+        nsd.resolveService(found, object : NsdManager.ResolveListener {
+            override fun onResolveFailed(i: NsdServiceInfo, e: Int) { done.complete(null) }
+            override fun onServiceResolved(i: NsdServiceInfo) { done.complete(i) }
+        })
+        withTimeoutOrNull(5000) { done.await() }
     }
 
     /** Keeps (re)connecting to a peer for as long as it stays advertised. */
@@ -286,6 +302,7 @@ class LanTransport(context: Context) : Transport {
         if (serviceName.startsWith(prefix)) serviceName.removePrefix(prefix).take(32).takeIf { it.length == 32 } else null
 
     companion object {
+        private val resolveLock = Mutex()
         private const val TYPE = "_p2pchat._tcp."
         private const val MAX_FRAME = 25 * 1024 * 1024 // room to grow for media chunks
         private val PING = "PING".toByteArray()
