@@ -1,6 +1,12 @@
 package com.example.p2pchat
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import android.graphics.Color as AndroidColor
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -42,6 +48,7 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT)
         )
+        val vm = (application as BrassApp).chatVm()   // one session for the whole app, kept alive by the service
         setContent {
             SteampunkTheme {
                 Box(Modifier.fillMaxSize().background(Steam.Backdrop)) {
@@ -50,7 +57,6 @@ class MainActivity : ComponentActivity() {
                         contentColor = Steam.Parchment,
                         modifier = Modifier.fillMaxSize().safeDrawingPadding()
                     ) {
-                        val vm: ChatViewModel = viewModel()
                         val room by vm.room.collectAsStateWithLifecycle()
                         val notice by vm.notice.collectAsStateWithLifecycle()
                         val r = room
@@ -71,6 +77,17 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        AppState.foreground = true
+        Notifier.clearMessages(this)
+    }
+
+    override fun onStop() {
+        AppState.foreground = false
+        super.onStop()
     }
 }
 
@@ -139,6 +156,7 @@ fun SettingRow(title: String, subtitle: String, checked: Boolean, onChange: (Boo
 @Composable
 fun SettingsDialog(s: AppSettings, onChange: (AppSettings) -> Unit, onErase: () -> Unit, onClose: () -> Unit) {
     var confirmErase by remember { mutableStateOf(false) }
+    val ctx = LocalContext.current
     AlertDialog(
         onDismissRequest = onClose,
         containerColor = Steam.Wood, titleContentColor = Steam.Brass, textContentColor = Steam.Parchment,
@@ -170,6 +188,24 @@ fun SettingsDialog(s: AppSettings, onChange: (AppSettings) -> Unit, onErase: () 
                 }
                 SettingRow("Keep received videos", "Takes effect once video sharing is added.", s.keepVideos) {
                     onChange(s.copy(keepVideos = it))
+                }
+                SettingRow(
+                    "Stay connected in background",
+                    "Keeps the room alive with the screen off. Shows a notification and uses more battery.",
+                    s.keepAlive
+                ) { onChange(s.copy(keepAlive = it)) }
+                if (s.keepAlive) {
+                    OutlinedButton(
+                        onClick = {
+                            runCatching {
+                                ctx.startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                            }
+                        },
+                        shape = RoundedCornerShape(4.dp),
+                        border = BorderStroke(1.dp, Steam.Copper),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Steam.Copper),
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Battery settings: set BrassTalks to Unrestricted") }
                 }
                 Text("Voice memos are never saved. They disappear when you leave a room.",
                     style = MaterialTheme.typography.bodySmall, color = Steam.ParchmentDim)
@@ -257,7 +293,7 @@ fun HomeScreen(vm: ChatViewModel) {
                 "Start a new room",
                 "Pick a passphrase, then share the room code and passphrase with your friends " +
                     "(up to ${Limits.MAX_ROOM} people). You'll be the host and can remove intruders. " +
-                    "The room keeps running even if you leave."
+                    "The room keeps running even if you leave. After a removal, the passphrase changes automatically for everyone aboard, and Invite shares the new one."
             )
             Spacer(Modifier.height(12.dp))
             Text("Your room code", style = MaterialTheme.typography.labelMedium, color = Steam.ParchmentDim)
@@ -411,6 +447,15 @@ fun ChatScreen(vm: ChatViewModel, room: RoomInfo) {
     val fieldColors = steamFieldColors()
     val ctx = LocalContext.current
 
+    val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
     val members = buildMembers(vm.myId, room.name, known, connected, hostId)
     val iAmHost = hostId == vm.myId
 
@@ -518,7 +563,7 @@ fun ChatScreen(vm: ChatViewModel, room: RoomInfo) {
                 !room.created && !searchedTooLong ->
                     "Searching the WiFi for this room…" to Steam.Verdigris
                 else ->
-                    "Nobody else found. Check that everyone is on the same WiFi and the code and passphrase match exactly." to Steam.Rust
+                    "Nobody else found. Check the WiFi and room code. If someone was removed recently, the passphrase may have changed: ask a member for the new one." to Steam.Rust
             }
             Surface(color = Steam.Wood, border = BorderStroke(1.dp, color), modifier = Modifier.fillMaxWidth().padding(8.dp)) {
                 Text(text, modifier = Modifier.padding(10.dp), style = MaterialTheme.typography.bodySmall)

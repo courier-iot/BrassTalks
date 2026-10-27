@@ -16,7 +16,8 @@ data class AppSettings(
     val keepHistory: Boolean = true,
     val retentionDays: Int = 0,      // 0 = keep forever
     val keepImages: Boolean = true,  // used once photo sharing is added
-    val keepVideos: Boolean = true   // used once video sharing is added
+    val keepVideos: Boolean = true,  // used once video sharing is added
+    val keepAlive: Boolean = true    // foreground service: stay connected with the screen off
 )
 
 object SettingsStore {
@@ -24,12 +25,13 @@ object SettingsStore {
         keepHistory = p.getBoolean("s_hist", true),
         retentionDays = p.getInt("s_days", 0),
         keepImages = p.getBoolean("s_img", true),
-        keepVideos = p.getBoolean("s_vid", true)
+        keepVideos = p.getBoolean("s_vid", true),
+        keepAlive = p.getBoolean("s_keep", true)
     )
 
     fun save(p: SharedPreferences, s: AppSettings) {
         p.edit().putBoolean("s_hist", s.keepHistory).putInt("s_days", s.retentionDays)
-            .putBoolean("s_img", s.keepImages).putBoolean("s_vid", s.keepVideos).apply()
+            .putBoolean("s_img", s.keepImages).putBoolean("s_vid", s.keepVideos).putBoolean("s_keep", s.keepAlive).apply()
     }
 }
 

@@ -12,6 +12,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import javax.crypto.SecretKey
 
 /**
@@ -19,6 +20,9 @@ import javax.crypto.SecretKey
  * Every phone listens on a port, advertises itself via mDNS (NSD), and connects to the others.
  * To avoid duplicate links, the peer with the smaller ID dials the larger one.
  * Rooms are capped at Limits.MAX_ROOM members; extra joiners are told the room is full.
+ *
+ * Keys: ring[0] is the current room key. Older keys are kept so that a member who missed a key change
+ * can reconnect, be handed the key-change bundle (never chat content), and catch up automatically.
  */
 class LanTransport(context: Context) : Transport {
     private val app = context.applicationContext
@@ -31,12 +35,14 @@ class LanTransport(context: Context) : Transport {
     private val dialing = ConcurrentHashMap.newKeySet<String>()
     private val banned = ConcurrentHashMap.newKeySet<String>()
     private val resolveQueue = Channel<NsdServiceInfo>(Channel.UNLIMITED)
+    private val ring = CopyOnWriteArrayList<Pair<String, SecretKey>>()   // (kid, key), newest first
+    @Volatile private var graceUntil = 0L
 
     private lateinit var selfId: String
     private lateinit var prefix: String
-    private lateinit var key: SecretKey
     private lateinit var onFrame: (ByteArray) -> Unit
     private lateinit var onPeers: (Set<String>) -> Unit
+    private lateinit var rescue: (String, String) -> ByteArray?
 
     private var lock: WifiManager.MulticastLock? = null
     private var server: ServerSocket? = null
@@ -47,12 +53,16 @@ class LanTransport(context: Context) : Transport {
         fun send(b: ByteArray) = synchronized(out) { out.writeInt(b.size); out.write(b); out.flush() }
     }
 
+    private class Match(val kid: String, val key: SecretKey, val plain: ByteArray)
+
     override fun start(
-        selfId: String, roomTag: String, key: SecretKey,
-        onFrame: (ByteArray) -> Unit, onPeers: (Set<String>) -> Unit
+        selfId: String, roomTag: String, kid: String, key: SecretKey,
+        onFrame: (ByteArray) -> Unit, onPeers: (Set<String>) -> Unit,
+        rescue: (String, String) -> ByteArray?
     ) {
-        this.selfId = selfId; this.prefix = "rm$roomTag-"; this.key = key
-        this.onFrame = onFrame; this.onPeers = onPeers
+        this.selfId = selfId; this.prefix = "rm$roomTag-"
+        this.onFrame = onFrame; this.onPeers = onPeers; this.rescue = rescue
+        ring.add(kid to key)
 
         lock = wifi.createMulticastLock("p2pchat").apply { setReferenceCounted(false); acquire() }
         val ss = ServerSocket(0).also { server = it }
@@ -116,7 +126,7 @@ class LanTransport(context: Context) : Transport {
 
         // Heartbeat so dead links are noticed quickly
         scope.launch {
-            while (isActive) { delay(10_000); broadcast(PING) }
+            while (isActive) { delay(10_000); writeAll(Crypto.encrypt(ring[0].second, PING)) }
         }
     }
 
@@ -136,7 +146,15 @@ class LanTransport(context: Context) : Transport {
         dialing.remove(peerId)
     }
 
-    /** Both sides send an encrypted HELLO. A wrong password fails to decrypt and the link is dropped. */
+    private fun decryptWithRing(data: ByteArray): Match? {
+        for ((kid, k) in ring) {
+            val p = Crypto.decrypt(k, data)
+            if (p != null) return Match(kid, k, p)
+        }
+        return null
+    }
+
+    /** Both sides send an encrypted HELLO. A wrong key fails to decrypt and the link is dropped. */
     private fun handshake(s: Socket) {
         var id: String? = null
         var conn: Conn? = null
@@ -146,17 +164,42 @@ class LanTransport(context: Context) : Transport {
             val input = DataInputStream(s.getInputStream().buffered())
             val c = Conn(s, DataOutputStream(s.getOutputStream().buffered()))
             conn = c
-            c.send(Crypto.encrypt(key, "HELLO:$selfId".toByteArray()))
+            val cur = ring[0]
+            c.send(Crypto.encrypt(cur.second, "HELLO:$selfId".toByteArray()))
 
-            val hello = Crypto.decrypt(key, readFrame(input))?.toString(Charsets.UTF_8) ?: return
+            val first = readFrame(input)
+            val m = decryptWithRing(first)
+            if (m == null) {
+                // We might be the one who is behind: the peer can hand us a key-change bundle sealed with OUR key.
+                val second = readFrame(input)
+                val p = Crypto.decrypt(cur.second, second)
+                if (p != null) onFrame(p)
+                return
+            }
+            val hello = m.plain.toString(Charsets.UTF_8)
             if (!hello.startsWith("HELLO:")) return
             val peer = hello.removePrefix("HELLO:")
             if (peer == selfId || banned.contains(peer)) return
 
+            if (m.kid != ring[0].first) {
+                // Peer is still on an older key. They don't get into the chat, but if they were a member
+                // we give them the bundle that moves them to the new key.
+                val bundle = rescue(peer, m.kid)
+                if (bundle != null) {
+                    runCatching {
+                        c.send(Crypto.encrypt(m.key, bundle))
+                        s.shutdownOutput()
+                        s.soTimeout = 1500
+                        while (input.read() >= 0) { }
+                    }
+                }
+                return
+            }
+
             // Room full: tell the newcomer politely, then close gracefully
             if (!conns.containsKey(peer) && conns.size >= Limits.MAX_PEERS) {
                 runCatching {
-                    c.send(Crypto.encrypt(key, FULL))
+                    c.send(Crypto.encrypt(m.key, FULL))
                     s.shutdownOutput()
                     s.soTimeout = 1500
                     while (input.read() >= 0) { }
@@ -169,8 +212,23 @@ class LanTransport(context: Context) : Transport {
             s.soTimeout = 25_000
             onPeers(conns.keys.toSet())
 
+            var badSince = 0L
             while (true) {
-                val plain = Crypto.decrypt(key, readFrame(input)) ?: continue
+                val raw = readFrame(input)
+                val snap = ring.toList()
+                var plain = Crypto.decrypt(snap[0].second, raw)
+                if (plain == null && snap.size > 1 && System.currentTimeMillis() < graceUntil) {
+                    plain = Crypto.decrypt(snap[1].second, raw)
+                }
+                if (plain == null) {
+                    // Undecryptable: usually a moment of key-change overlap. If it lasts, drop the link so the
+                    // peer reconnects and gets brought up to date.
+                    val now = System.currentTimeMillis()
+                    if (badSince == 0L) badSince = now
+                    if (now - badSince > 45_000) break
+                    continue
+                }
+                badSince = 0L
                 if (plain.contentEquals(PING)) continue
                 onFrame(plain)
             }
@@ -187,12 +245,25 @@ class LanTransport(context: Context) : Transport {
         return ByteArray(n).also { input.readFully(it) }
     }
 
-    private fun broadcast(plain: ByteArray) {
-        val enc = Crypto.encrypt(key, plain)
+    private fun writeAll(enc: ByteArray) {
         conns.values.forEach { c -> runCatching { c.send(enc) }.onFailure { runCatching { c.socket.close() } } }
     }
 
-    override fun send(frame: ByteArray) { scope.launch { broadcast(frame) } }
+    /** Encrypts right now with the current key (so a frame sent just before a key change stays on the old key). */
+    override fun send(frame: ByteArray) {
+        val enc = Crypto.encrypt(ring[0].second, frame)
+        scope.launch { writeAll(enc) }
+    }
+
+    override fun rekey(kid: String, key: SecretKey) {
+        if (ring.any { it.first == kid }) return
+        ring.add(0, kid to key)
+        graceUntil = System.currentTimeMillis() + 120_000
+    }
+
+    override fun addLegacyKey(kid: String, key: SecretKey) {
+        if (ring.none { it.first == kid }) ring.add(kid to key)
+    }
 
     override fun ban(id: String) {
         banned.add(id)
