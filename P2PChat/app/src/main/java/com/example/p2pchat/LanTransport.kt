@@ -18,6 +18,7 @@ import javax.crypto.SecretKey
  * Serverless full mesh over the local network.
  * Every phone listens on a port, advertises itself via mDNS (NSD), and connects to the others.
  * To avoid duplicate links, the peer with the smaller ID dials the larger one.
+ * Rooms are capped at Limits.MAX_ROOM members; extra joiners are told the room is full.
  */
 class LanTransport(context: Context) : Transport {
     private val app = context.applicationContext
@@ -28,13 +29,14 @@ class LanTransport(context: Context) : Transport {
     private val conns = ConcurrentHashMap<String, Conn>()
     private val known = ConcurrentHashMap<String, Pair<String, Int>>() // peerId -> host,port
     private val dialing = ConcurrentHashMap.newKeySet<String>()
+    private val banned = ConcurrentHashMap.newKeySet<String>()
     private val resolveQueue = Channel<NsdServiceInfo>(Channel.UNLIMITED)
 
     private lateinit var selfId: String
     private lateinit var prefix: String
     private lateinit var key: SecretKey
     private lateinit var onFrame: (ByteArray) -> Unit
-    private lateinit var onPeers: (Int) -> Unit
+    private lateinit var onPeers: (Set<String>) -> Unit
 
     private var lock: WifiManager.MulticastLock? = null
     private var server: ServerSocket? = null
@@ -47,7 +49,7 @@ class LanTransport(context: Context) : Transport {
 
     override fun start(
         selfId: String, roomTag: String, key: SecretKey,
-        onFrame: (ByteArray) -> Unit, onPeers: (Int) -> Unit
+        onFrame: (ByteArray) -> Unit, onPeers: (Set<String>) -> Unit
     ) {
         this.selfId = selfId; this.prefix = "rm$roomTag-"; this.key = key
         this.onFrame = onFrame; this.onPeers = onPeers
@@ -85,7 +87,7 @@ class LanTransport(context: Context) : Transport {
             override fun onStopDiscoveryFailed(t: String, e: Int) {}
             override fun onServiceFound(i: NsdServiceInfo) {
                 val id = peerIdOf(i.serviceName) ?: return
-                if (id != selfId) resolveQueue.trySend(i)
+                if (id != selfId && !banned.contains(id)) resolveQueue.trySend(i)
             }
             override fun onServiceLost(i: NsdServiceInfo) {
                 peerIdOf(i.serviceName)?.let { known.remove(it) }
@@ -104,6 +106,7 @@ class LanTransport(context: Context) : Transport {
                 })
                 val r = withTimeoutOrNull(5000) { done.await() } ?: continue
                 val id = peerIdOf(r.serviceName) ?: continue
+                if (banned.contains(id)) continue
                 @Suppress("DEPRECATION")
                 val host = r.host?.hostAddress ?: continue
                 known[id] = host to r.port
@@ -141,16 +144,30 @@ class LanTransport(context: Context) : Transport {
             s.keepAlive = true
             s.soTimeout = 5000
             val input = DataInputStream(s.getInputStream().buffered())
-            conn = Conn(s, DataOutputStream(s.getOutputStream().buffered()))
-            conn.send(Crypto.encrypt(key, "HELLO:$selfId".toByteArray()))
+            val c = Conn(s, DataOutputStream(s.getOutputStream().buffered()))
+            conn = c
+            c.send(Crypto.encrypt(key, "HELLO:$selfId".toByteArray()))
 
             val hello = Crypto.decrypt(key, readFrame(input))?.toString(Charsets.UTF_8) ?: return
             if (!hello.startsWith("HELLO:")) return
             val peer = hello.removePrefix("HELLO:")
-            if (peer == selfId || conns.putIfAbsent(peer, conn) != null) return
+            if (peer == selfId || banned.contains(peer)) return
+
+            // Room full: tell the newcomer politely, then close gracefully
+            if (!conns.containsKey(peer) && conns.size >= Limits.MAX_PEERS) {
+                runCatching {
+                    c.send(Crypto.encrypt(key, FULL))
+                    s.shutdownOutput()
+                    s.soTimeout = 1500
+                    while (input.read() >= 0) { }
+                }
+                return
+            }
+
+            if (conns.putIfAbsent(peer, c) != null) return
             id = peer
             s.soTimeout = 25_000
-            onPeers(conns.size)
+            onPeers(conns.keys.toSet())
 
             while (true) {
                 val plain = Crypto.decrypt(key, readFrame(input)) ?: continue
@@ -159,7 +176,7 @@ class LanTransport(context: Context) : Transport {
             }
         } catch (_: Exception) {
         } finally {
-            if (id != null && conn != null && conns.remove(id, conn)) onPeers(conns.size)
+            if (id != null && conn != null && conns.remove(id, conn)) onPeers(conns.keys.toSet())
             runCatching { s.close() }
         }
     }
@@ -176,6 +193,12 @@ class LanTransport(context: Context) : Transport {
     }
 
     override fun send(frame: ByteArray) { scope.launch { broadcast(frame) } }
+
+    override fun ban(id: String) {
+        banned.add(id)
+        known.remove(id)
+        conns[id]?.let { runCatching { it.socket.close() } }
+    }
 
     override fun stop() {
         scope.cancel()
@@ -195,5 +218,6 @@ class LanTransport(context: Context) : Transport {
         private const val TYPE = "_p2pchat._tcp."
         private const val MAX_FRAME = 25 * 1024 * 1024 // room to grow for media chunks
         private val PING = "PING".toByteArray()
+        private val FULL = """{"type":"full"}""".toByteArray()
     }
 }

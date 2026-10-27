@@ -12,6 +12,9 @@ import javax.crypto.spec.SecretKeySpec
 object Crypto {
     private val rng = SecureRandom()
 
+    fun sha256Hex(data: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(data).joinToString("") { "%02x".format(it) }
+
     /** Password -> 256-bit AES key. Room code acts as salt. Slow on purpose; call off the main thread. */
     fun deriveKey(password: String, roomCode: String): SecretKey {
         val spec = PBEKeySpec(password.toCharArray(), "p2pchat:$roomCode".toByteArray(), 100_000, 256)
@@ -20,9 +23,7 @@ object Crypto {
     }
 
     /** Public, non-reversible room label used for discovery (the real room code is never broadcast). */
-    fun roomTag(roomCode: String): String =
-        MessageDigest.getInstance("SHA-256").digest(roomCode.toByteArray())
-            .joinToString("") { "%02x".format(it) }.take(12)
+    fun roomTag(roomCode: String): String = sha256Hex(roomCode.toByteArray()).take(12)
 
     fun encrypt(key: SecretKey, plain: ByteArray): ByteArray {
         val iv = ByteArray(12).also { rng.nextBytes(it) }
