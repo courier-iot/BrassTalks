@@ -1,0 +1,56 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: P2PChat
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+          build-root-directory: P2PChat
+
+      # Victorian heading font: Cinzel Decorative, SIL Open Font License (free to bundle in apps).
+      # Downloaded at build time; the licence goes into the app alongside it.
+      - name: Fetch Victorian font
+        run: |
+          mkdir -p app/src/main/res/font app/src/main/assets/licenses
+          base=https://github.com/google/fonts/raw/main/ofl/cinzeldecorative
+          curl -fsSL -o app/src/main/res/font/cinzel_decorative.ttf      "$base/CinzelDecorative-Regular.ttf"
+          curl -fsSL -o app/src/main/res/font/cinzel_decorative_bold.ttf "$base/CinzelDecorative-Bold.ttf"
+          curl -fsSL -o app/src/main/assets/licenses/CinzelDecorative-OFL.txt "$base/OFL.txt"
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk BrassTalks.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: P2PChat-apk
+          path: P2PChat/BrassTalks.apk
+
+      - name: Attach APK to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: P2PChat/BrassTalks.apk
