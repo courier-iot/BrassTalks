@@ -19,6 +19,9 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.OutputStream
+import java.io.RandomAccessFile
 import java.security.PrivateKey
 import java.security.SecureRandom
 import java.util.UUID
@@ -29,7 +32,10 @@ import kotlin.math.abs
 data class Msg(
     val id: String, val senderId: String, val senderName: String,
     val text: String, val ts: Long, val system: Boolean = false,
-    val image: String? = null, val imgW: Int = 0, val imgH: Int = 0
+    val image: String? = null, val imgW: Int = 0, val imgH: Int = 0,
+    val voice: String? = null, val durMs: Long = 0,
+    val video: String? = null,
+    val replyTo: String? = null      // id of the message this one answers
 )
 
 /** created = true when this phone built the carriage (the creator is its host). */
@@ -70,6 +76,7 @@ class CarriageSession(
     private val prefs: SharedPreferences,
     private val store: HistoryStore,
     private val vault: PhotoVault,
+    val people: PeopleBook,
     val myId: String,
     private val myPub: ByteArray,
     private val ecdh: Pair<PrivateKey, ByteArray>,
@@ -140,8 +147,9 @@ class CarriageSession(
         messages.value = history
         // Photos: honour the "keep photos" and history settings
         withContext(Dispatchers.IO) {
-            if (!s.keepImages || !s.keepHistory) vault.delete(tag)
-            else vault.prune(tag, history.mapNotNull { it.image }.toSet())
+            if (!s.keepHistory) vault.delete(tag) else vault.prune(tag, keepKeys(history, s))
+            app.cacheDir.listFiles { _, nm -> nm.startsWith("vin_") || nm.startsWith("vout_") || nm.startsWith("play_") }
+                ?.forEach { if (System.currentTimeMillis() - it.lastModified() > 3_600_000) it.delete() }
         }
 
         val t = LanTransport(app)
@@ -163,6 +171,7 @@ class CarriageSession(
                 delay(30_000)
                 announce()
                 purgeVotes()
+                sweepTransfers()
                 val pending = synchronized(banned) {
                     banned.any { it !in excluded && evidence[it]?.isNotEmpty() == true }
                 }
@@ -175,14 +184,16 @@ class CarriageSession(
         if (closed) return
         closed = true
         val t = tag
-        val snapshot = messages.value
+        val snapshot = saveable()
         val s = settings.value
         bgJob?.cancel(); saveJob?.cancel()
         transport?.stop(); transport = null
+        synchronized(voices) { voices.clear() }
+        dropAssemblies()
         prefs.edit().remove("excl_$t").remove("bundles_$t").remove("prev_$t").remove("nick_$t").apply()
         scope.launch(Dispatchers.IO) {
             if (eraseHistory || !s.keepHistory) store.delete(t) else store.save(t, snapshot, s.retentionDays)
-            if (eraseHistory || !s.keepHistory || !s.keepImages) vault.delete(t)
+            if (eraseHistory || !s.keepHistory) vault.delete(t) else vault.prune(t, keepKeys(snapshot, s))
         }
         onLeft(this)
     }
@@ -190,22 +201,25 @@ class CarriageSession(
     /** Stop without forgetting anything (app is going away). */
     fun close() {
         bgJob?.cancel(); saveJob?.cancel()
-        if (settings.value.keepHistory) runCatching { store.save(tag, messages.value, settings.value.retentionDays) }
+        if (settings.value.keepHistory) runCatching { store.save(tag, saveable(), settings.value.retentionDays) }
         transport?.stop(); transport = null
+        synchronized(voices) { voices.clear() }
+        dropAssemblies()
     }
 
     // ---------- Sending ----------
 
-    fun send(text: String) {
+    fun send(text: String, replyTo: String? = null) {
         val r = room.value
         val t = text.trim().ifEmpty { return }
         val id = UUID.randomUUID().toString()
         val ts = System.currentTimeMillis()
-        add(Msg(id, myId, r.name, t, ts))
+        val re = replyTo ?: ""
+        add(Msg(id, myId, r.name, t, ts, replyTo = replyTo))
         scope.launch(Dispatchers.Default) {
-            val sig = Identity.sign("msg|$tag|$id|$myId|$ts|$t".toByteArray())
+            val sig = Identity.sign("msg|$tag|$id|$myId|$ts|$t|$re".toByteArray())
             transport?.send(JSONObject().put("type", "msg").put("id", id).put("sid", myId)
-                .put("n", r.name).put("text", t).put("ts", ts)
+                .put("n", r.name).put("text", t).put("ts", ts).put("re", re)
                 .put("pk", b64(myPub)).put("sig", b64(sig)).toString().toByteArray())
         }
     }
@@ -246,8 +260,8 @@ class CarriageSession(
                     leave(false)
                 }
                 "msg" -> handleMsg(j)
-                "img" -> handleImgHeader(j)
-                "imgc" -> handleImgChunk(j)
+                "media" -> handleMediaHeader(j)
+                "mc" -> handleMediaChunk(j)
                 "hi" -> handleHi(j)
                 "kick" -> handleKick(j)
                 "kv" -> handleVote(j)
@@ -270,12 +284,16 @@ class CarriageSession(
         val id = j.getString("id"); val n = j.getString("n")
         val text = j.getString("text"); val ts = j.getLong("ts")
         if (text.length > 4000) return
-        if (!verified(j, "msg|$tag|$id|$sid|$ts|$text")) return
-        known.update { it + (sid to n) }
-        add(Msg(id, sid, n, text, ts))
+        val re = j.optString("re", "")
+        if (re.length > 64) return
+        if (!verified(j, "msg|$tag|$id|$sid|$ts|$text|$re")) return
+        people.seen(sid, n)
+        val shown = people.alias(sid, n)
+        known.update { it + (sid to shown) }
+        add(Msg(id, sid, shown, text, ts, replyTo = re.ifEmpty { null }))
         if (sid != myId) {
             if (!(AppState.foreground && viewing(tag))) unread.update { it + 1 }
-            if (!AppState.foreground) Notifier.message(app, displayName(), n, text)
+            if (!AppState.foreground) Notifier.message(app, displayName(), people.label(sid, n), text)
         }
     }
 
@@ -285,7 +303,8 @@ class CarriageSession(
         val n = j.getString("n"); val h = j.getBoolean("h"); val ts = j.getLong("ts")
         val ek = j.optString("ek")
         if (!verified(j, "hi|$tag|$sid|$n|$h|$ts|$ek")) return
-        known.update { it + (sid to n) }
+        people.seen(sid, n)
+        known.update { it + (sid to people.alias(sid, n)) }
         if (ek.isNotEmpty()) eks[sid] = Base64.decode(ek, Base64.NO_WRAP)
         // Host claim: trust the first one we see (see TODO: verify via invite).
         if (h && hostId.value == null && sid != myId) {
@@ -306,100 +325,355 @@ class CarriageSession(
         onChanged()
     }
 
-    // ---------- Photos ----------
+    // ---------- Photos, voice notes and videos ----------
     //
-    // A photo is shrunk (about 1280px, JPEG), then sent as one signed header (carries a fingerprint of the
-    // whole picture) plus small encrypted chunks. Receivers rebuild it, check the fingerprint matches the
-    // signed header, and only then show it. Chunks may arrive in any order.
+    // Each item is sent as one signed header plus small encrypted pieces. The header lists a fingerprint for
+    // every piece, so each piece is checked the moment it arrives: a junk piece from anyone else is thrown away
+    // and the real one is still accepted. Pieces without a genuine signed header are ignored entirely.
+    // Photos and videos are stored encrypted on the phone. Voice notes are kept in memory only: they vanish
+    // when you leave the carriage or the app is fully closed, and are never written to history.
+    // Videos are written piece by piece to a private temporary file while arriving (they can be large).
 
-    private class Assembly {
-        @Volatile var header: JSONObject? = null
-        val chunks = ConcurrentHashMap<Int, ByteArray>()
-        val started = System.currentTimeMillis()
+    private class Assembly(val header: JSONObject, val hashes: List<String>, val file: File?) {
+        val chunks = ConcurrentHashMap<Int, ByteArray>()     // photos and voice notes: pieces in memory
+        val got = ConcurrentHashMap.newKeySet<Int>()          // which pieces have arrived
+        val raf: RandomAccessFile? = file?.let { RandomAccessFile(it, "rw") }
+        @Volatile var lastActivity = System.currentTimeMillis()
+        @Volatile var done = false
+
+        fun discard() {
+            runCatching { raf?.close() }
+            file?.delete()
+        }
     }
 
     private val assemblies = ConcurrentHashMap<String, Assembly>()
+    private val voices = LinkedHashMap<String, ByteArray>()   // guarded by synchronized(voices)
+
+    /** Progress per item: 0..1 while moving, -1 if it failed. Absent once it is done. */
+    val transfers = MutableStateFlow<Map<String, Float>>(emptyMap())
+    /** Your own videos being shrunk before sending: 0..1 */
+    val preparing = MutableStateFlow<Map<String, Float>>(emptyMap())
 
     fun readImage(m: Msg): ByteArray? = m.image?.let { vault.read(tag, it) }
+    fun readVoice(m: Msg): ByteArray? = m.voice?.let { synchronized(voices) { voices[it] } }
+    fun readThumb(m: Msg): ByteArray? = m.video?.let { vault.read(tag, thumbKey(it)) }
+    fun hasVideo(m: Msg): Boolean = m.video?.let { vault.exists(tag, videoKey(it)) } ?: false
+    fun exportVideo(m: Msg, dest: File): Boolean = m.video?.let { vault.decryptTo(tag, videoKey(it), dest) } ?: false
+    fun copyVideo(m: Msg, out: OutputStream): Boolean = m.video?.let { vault.copyTo(tag, videoKey(it), out) } ?: false
 
-    fun sendPhoto(uri: Uri) {
-        val r = room.value
-        scope.launch(Dispatchers.IO) {
-            val res = ImageUtil.compress(app, uri)
-            if (res == null) {
-                onNotice("Couldn't read that photo.")
-                return@launch
-            }
-            val id = UUID.randomUUID().toString()
-            val ts = System.currentTimeMillis()
-            val hash = Crypto.sha256Hex(res.bytes)
-            val chunks = (res.bytes.size + CHUNK - 1) / CHUNK
-            vault.save(tag, id, res.bytes)
-            add(Msg(id, myId, r.name, "", ts, image = id, imgW = res.w, imgH = res.h))
+    private fun setProgress(id: String, p: Float?) {
+        transfers.update { if (p == null) it - id else it + (id to p) }
+    }
 
-            val sig = Identity.sign("img|$tag|$id|$myId|$ts|${res.bytes.size}|$chunks|$hash".toByteArray())
-            transport?.send(JSONObject().put("type", "img").put("id", id).put("sid", myId).put("n", r.name)
-                .put("ts", ts).put("size", res.bytes.size).put("chunks", chunks).put("w", res.w).put("h", res.h)
-                .put("hash", hash).put("pk", b64(myPub)).put("sig", b64(sig)).toString().toByteArray())
-            for (i in 0 until chunks) {
-                val part = res.bytes.copyOfRange(i * CHUNK, minOf((i + 1) * CHUNK, res.bytes.size))
-                transport?.send(JSONObject().put("type", "imgc").put("id", id).put("sid", myId)
-                    .put("i", i).put("d", b64(part)).toString().toByteArray())
-                if (i % 4 == 3) delay(20)   // let chat messages and heartbeats slip in between
+    private fun rememberVoice(id: String, bytes: ByteArray) {
+        synchronized(voices) {
+            voices[id] = bytes
+            var total = voices.values.sumOf { it.size.toLong() }
+            val iter = voices.entries.iterator()
+            while (total > MAX_VOICE_MEMORY && iter.hasNext()) {
+                val e = iter.next()
+                if (e.key == id) continue
+                total -= e.value.size
+                iter.remove()
             }
         }
     }
 
-    private fun assemblyFor(id: String): Assembly? {
-        assemblies[id]?.let { return it }
-        val cutoff = System.currentTimeMillis() - 120_000
-        assemblies.entries.removeIf { it.value.started < cutoff }
-        if (assemblies.size >= MAX_ASSEMBLIES) return null
-        return assemblies.getOrPut(id) { Assembly() }
+    /** What goes into saved history: never voice notes, and no incoming photos/videos that didn't finish. */
+    private fun saveable(): List<Msg> {
+        val moving = transfers.value
+        return messages.value.filter { m ->
+            m.voice == null &&
+                !((m.image != null || m.video != null) && m.senderId != myId && moving.containsKey(m.id))
+        }
     }
 
-    private fun handleImgHeader(j: JSONObject) {
-        val sid = j.getString("sid")
-        if (isBanned(sid) || sid == myId) return
-        val id = j.getString("id"); val ts = j.getLong("ts")
-        val size = j.getInt("size"); val chunks = j.getInt("chunks"); val hash = j.getString("hash")
-        if (size !in 1..MAX_IMG || chunks !in 1..MAX_CHUNKS) return
-        if (!verified(j, "img|$tag|$id|$sid|$ts|$size|$chunks|$hash")) return
-        if (synchronized(seen) { seen.contains(id) }) return
-        val a = assemblyFor(id) ?: return
-        a.header = j
-        tryComplete(id)
+    /** Which stored files to keep, given the history being kept and your settings. */
+    private fun keepKeys(list: List<Msg>, s: AppSettings): Set<String> {
+        val keep = HashSet<String>()
+        if (s.keepImages) list.forEach { m -> m.image?.let { keep.add(it) } }
+        if (s.keepVideos) list.forEach { m -> m.video?.let { keep.add(videoKey(it)); keep.add(thumbKey(it)) } }
+        return keep
     }
 
-    private fun handleImgChunk(j: JSONObject) {
-        val sid = j.getString("sid")
-        if (isBanned(sid) || sid == myId) return
-        val id = j.getString("id"); val i = j.getInt("i"); val d = j.getString("d")
-        if (i !in 0 until MAX_CHUNKS || d.length > 90_000) return
-        val a = assemblyFor(id) ?: return
-        a.chunks.putIfAbsent(i, Base64.decode(d, Base64.NO_WRAP))
-        tryComplete(id)
+    private fun dropAssemblies() {
+        assemblies.values.forEach { it.discard() }
+        assemblies.clear()
     }
 
-    private fun tryComplete(id: String) {
-        val a = assemblies[id] ?: return
-        val hd = a.header ?: return
-        val total = hd.getInt("chunks")
-        if (a.chunks.size < total) return
-        if (!assemblies.remove(id, a)) return
-        val out = ByteArrayOutputStream()
-        for (i in 0 until total) out.write(a.chunks[i] ?: return)
-        val data = out.toByteArray()
-        if (data.size != hd.getInt("size") || Crypto.sha256Hex(data) != hd.getString("hash")) return
-
-        val sid = hd.getString("sid"); val n = hd.getString("n"); val ts = hd.getLong("ts")
-        val w = hd.optInt("w", 0); val ht = hd.optInt("h", 0)
+    fun sendPhoto(uri: Uri, q: Quality = Quality.STANDARD) {
         scope.launch(Dispatchers.IO) {
-            vault.save(tag, id, data)
-            known.update { it + (sid to n) }
-            add(Msg(id, sid, n, "", ts, image = id, imgW = w, imgH = ht))
-            if (!(AppState.foreground && viewing(tag))) unread.update { it + 1 }
-            if (!AppState.foreground) Notifier.message(app, displayName(), n, "\uD83D\uDCF7 Photo")
+            val res = if (q == Quality.ORIGINAL) ImageUtil.original(app, uri)
+                      else ImageUtil.compress(app, uri, q.photoSide, q.photoTarget)
+            if (res == null) {
+                onNotice(if (q == Quality.ORIGINAL) "That photo is over 25 MB or couldn't be read. Try High quality."
+                         else "Couldn't read that photo.")
+                return@launch
+            }
+            val id = UUID.randomUUID().toString()
+            vault.save(tag, id, res.bytes)
+            sendMedia(id, KIND_IMAGE, res.bytes, res.w, res.h, 0L)
+        }
+    }
+
+    fun sendVoice(bytes: ByteArray, durMs: Long) {
+        if (bytes.isEmpty() || bytes.size > MAX_MEDIA) {
+            onNotice("That voice note is too large to send.")
+            return
+        }
+        scope.launch(Dispatchers.IO) {
+            val id = UUID.randomUUID().toString()
+            rememberVoice(id, bytes)
+            sendMedia(id, KIND_VOICE, bytes, 0, 0, durMs)
+        }
+    }
+
+    fun sendVideo(uri: Uri, q: Quality = Quality.STANDARD) {
+        val r = room.value
+        scope.launch(Dispatchers.IO) {
+            val info = VideoUtil.probe(app, uri)
+            if (info == null) {
+                onNotice("Couldn't read that video.")
+                return@launch
+            }
+            if (info.durMs > MAX_VIDEO_MS + 999) {
+                onNotice("Videos can be up to 5 minutes long. That one is ${fmtDur(info.durMs)}.")
+                return@launch
+            }
+            val id = UUID.randomUUID().toString()
+            val ts = System.currentTimeMillis()
+            info.thumb?.let { vault.save(tag, thumbKey(id), it) }
+            preparing.update { it + (id to 0f) }
+            add(Msg(id, myId, r.name, "", ts, imgW = info.w, imgH = info.h, durMs = info.durMs, video = id))
+
+            val out = File(app.cacheDir, "vout_$id.mp4")
+            val ok = try {
+                VideoUtil.transcode(app, uri, out, info, if (q == Quality.ORIGINAL) Quality.HIGH else q) { p -> preparing.update { m -> m + (id to p) } }
+            } catch (e: Exception) { false }
+            preparing.update { it - id }
+            if (!ok || !out.exists() || out.length() !in 1L..MAX_VIDEO_BYTES.toLong()) {
+                out.delete()
+                setProgress(id, -1f)
+                onNotice(
+                    if (ok) "That video is still too large after shrinking. Try a shorter clip."
+                    else "Couldn't prepare that video on this phone."
+                )
+                return@launch
+            }
+            try {
+                vault.saveFrom(tag, videoKey(id), out)
+                sendVideoFile(id, ts, out, info)
+            } finally {
+                out.delete()
+            }
+        }
+    }
+
+    private fun pieceHash(b: ByteArray): String = Crypto.sha256Hex(b).take(32)
+
+    private fun header(
+        id: String, ts: Long, kind: String, size: Int, hashes: List<String>,
+        w: Int, h: Int, dur: Long, thumb: ByteArray?
+    ): ByteArray {
+        val r = room.value
+        val chunks = hashes.size
+        val listHash = Crypto.sha256Hex(hashes.joinToString(",").toByteArray())
+        val th = thumb?.let { Crypto.sha256Hex(it) } ?: ""
+        val sig = Identity.sign("media|$tag|$id|$myId|$ts|$kind|$size|$chunks|$listHash|$w|$h|$dur|$th".toByteArray())
+        val j = JSONObject().put("type", "media").put("id", id).put("sid", myId).put("n", r.name)
+            .put("ts", ts).put("k", kind).put("size", size).put("chunks", chunks)
+            .put("hashes", JSONArray(hashes)).put("w", w).put("h", h).put("dur", dur).put("th", th)
+            .put("pk", b64(myPub)).put("sig", b64(sig))
+        if (thumb != null) j.put("thumb", b64(thumb))
+        return j.toString().toByteArray()
+    }
+
+    private fun piece(id: String, i: Int, part: ByteArray): ByteArray =
+        JSONObject().put("type", "mc").put("id", id).put("i", i).put("d", b64(part)).toString().toByteArray()
+
+    private suspend fun sendMedia(id: String, kind: String, bytes: ByteArray, w: Int, h: Int, dur: Long) {
+        val r = room.value
+        val ts = System.currentTimeMillis()
+        val chunks = (bytes.size + CHUNK - 1) / CHUNK
+        val hashes = (0 until chunks).map { i ->
+            pieceHash(bytes.copyOfRange(i * CHUNK, minOf((i + 1) * CHUNK, bytes.size)))
+        }
+        setProgress(id, 0f)
+        add(
+            if (kind == KIND_IMAGE) Msg(id, myId, r.name, "", ts, image = id, imgW = w, imgH = h)
+            else Msg(id, myId, r.name, "", ts, voice = id, durMs = dur)
+        )
+        try {
+            transport?.sendBlocking(header(id, ts, kind, bytes.size, hashes, w, h, dur, null))
+            for (i in 0 until chunks) {
+                if (closed) return
+                transport?.sendBlocking(piece(id, i, bytes.copyOfRange(i * CHUNK, minOf((i + 1) * CHUNK, bytes.size))))
+                setProgress(id, (i + 1).toFloat() / chunks)
+                if (i % 4 == 3) delay(15)   // let chat messages and heartbeats slip in between
+            }
+            setProgress(id, null)
+        } catch (e: Exception) {
+            setProgress(id, -1f)
+        }
+    }
+
+    private suspend fun sendVideoFile(id: String, ts: Long, f: File, info: VideoUtil.Info) {
+        val size = f.length().toInt()
+        val chunks = (size + CHUNK - 1) / CHUNK
+        val buf = ByteArray(CHUNK)
+        fun readPiece(raf: RandomAccessFile, i: Int): ByteArray {
+            val len = minOf(CHUNK, size - i * CHUNK)
+            raf.seek(i.toLong() * CHUNK)
+            raf.readFully(buf, 0, len)
+            return buf.copyOf(len)
+        }
+        setProgress(id, 0f)
+        try {
+            val hashes = RandomAccessFile(f, "r").use { raf -> (0 until chunks).map { pieceHash(readPiece(raf, it)) } }
+            transport?.sendBlocking(header(id, ts, KIND_VIDEO, size, hashes, info.w, info.h, info.durMs, info.thumb))
+            RandomAccessFile(f, "r").use { raf ->
+                for (i in 0 until chunks) {
+                    if (closed) return
+                    transport?.sendBlocking(piece(id, i, readPiece(raf, i)))
+                    setProgress(id, (i + 1).toFloat() / chunks)
+                    if (i % 4 == 3) delay(15)
+                }
+            }
+            setProgress(id, null)
+        } catch (e: Exception) {
+            setProgress(id, -1f)
+        }
+    }
+
+    private fun handleMediaHeader(j: JSONObject) {
+        val sid = j.getString("sid")
+        if (isBanned(sid) || sid == myId) return
+        val id = j.getString("id"); val n = j.getString("n"); val ts = j.getLong("ts")
+        val kind = j.getString("k"); val size = j.getInt("size"); val chunks = j.getInt("chunks")
+        val w = j.optInt("w", 0); val h = j.optInt("h", 0); val dur = j.optLong("dur", 0L)
+        val th = j.optString("th", "")
+        val limit = when (kind) {
+            KIND_IMAGE -> ImageUtil.MAX_ORIGINAL
+            KIND_VOICE -> MAX_MEDIA
+            KIND_VIDEO -> MAX_VIDEO_BYTES
+            else -> return
+        }
+        if (size !in 1..limit || chunks != (size + CHUNK - 1) / CHUNK) return
+        if (kind == KIND_VIDEO && dur > MAX_VIDEO_MS + 999) return
+        val arr = j.getJSONArray("hashes")
+        if (arr.length() != chunks) return
+        val hashes = (0 until chunks).map { arr.getString(it) }
+        val listHash = Crypto.sha256Hex(hashes.joinToString(",").toByteArray())
+        if (!verified(j, "media|$tag|$id|$sid|$ts|$kind|$size|$chunks|$listHash|$w|$h|$dur|$th")) return
+        if (synchronized(seen) { seen.contains(id) }) return
+
+        // Video preview picture, checked against the signed fingerprint
+        var thumb: ByteArray? = null
+        if (kind == KIND_VIDEO && th.isNotEmpty()) {
+            val t = j.optString("thumb", "")
+            if (t.length > 300_000) return
+            thumb = try { Base64.decode(t, Base64.NO_WRAP) } catch (e: Exception) { return }
+            if (Crypto.sha256Hex(thumb) != th) return
+        }
+
+        sweepTransfers()
+        if (assemblies.size >= MAX_ASSEMBLIES) return
+        // Videos and large (original) photos are assembled on disk rather than in memory
+        val file = if (kind == KIND_VIDEO || size > MAX_MEDIA) File(app.cacheDir, "vin_$id.part") else null
+        val a = try { Assembly(j, hashes, file) } catch (e: Exception) { return }
+        if (assemblies.putIfAbsent(id, a) != null) { a.discard(); return }
+        people.seen(sid, n)
+        val shown = people.alias(sid, n)
+        known.update { it + (sid to shown) }
+        setProgress(id, 0f)
+        when (kind) {
+            KIND_IMAGE -> add(Msg(id, sid, shown, "", ts, image = id, imgW = w, imgH = h))
+            KIND_VOICE -> add(Msg(id, sid, shown, "", ts, voice = id, durMs = dur))
+            else -> {
+                thumb?.let { tb -> scope.launch(Dispatchers.IO) { vault.save(tag, thumbKey(id), tb) } }
+                add(Msg(id, sid, shown, "", ts, imgW = w, imgH = h, durMs = dur, video = id))
+            }
+        }
+    }
+
+    private fun handleMediaChunk(j: JSONObject) {
+        val id = j.getString("id"); val i = j.getInt("i"); val d = j.getString("d")
+        val a = assemblies[id] ?: return                 // pieces without a signed header are ignored
+        if (i !in a.hashes.indices || d.length > 70_000) return
+        if (a.got.contains(i)) return
+        val bytes = try { Base64.decode(d, Base64.NO_WRAP) } catch (e: Exception) { return }
+        if (pieceHash(bytes) != a.hashes[i]) return      // junk piece: ignore it and keep waiting for the real one
+        synchronized(a) {
+            if (a.done || !a.got.add(i)) return
+            val raf = a.raf
+            if (raf != null) {
+                try {
+                    raf.seek(i.toLong() * CHUNK)
+                    raf.write(bytes)
+                } catch (e: Exception) {
+                    a.got.remove(i)
+                    return
+                }
+            } else {
+                a.chunks[i] = bytes
+            }
+        }
+        a.lastActivity = System.currentTimeMillis()
+        setProgress(id, a.got.size.toFloat() / a.hashes.size)
+        if (a.got.size == a.hashes.size) complete(id, a)
+    }
+
+    private fun complete(id: String, a: Assembly) {
+        synchronized(a) {
+            if (a.done) return
+            a.done = true
+        }
+        assemblies.remove(id, a)
+        val hd = a.header
+        val kind = hd.getString("k"); val size = hd.getInt("size")
+        val n = people.label(hd.getString("sid"), hd.getString("n"))
+        scope.launch(Dispatchers.IO) {
+            try {
+                val f = a.file
+                if (f != null) {
+                    runCatching { a.raf?.close() }
+                    if (f.length() != size.toLong()) { setProgress(id, -1f); return@launch }
+                    vault.saveFrom(tag, if (kind == KIND_VIDEO) videoKey(id) else id, f)
+                } else {
+                    val out = ByteArrayOutputStream()
+                    for (i in a.hashes.indices) out.write(a.chunks[i] ?: run { setProgress(id, -1f); return@launch })
+                    val data = out.toByteArray()
+                    if (data.size != size) { setProgress(id, -1f); return@launch }
+                    if (kind == KIND_IMAGE) vault.save(tag, id, data) else rememberVoice(id, data)
+                }
+                setProgress(id, null)
+                if (!(AppState.foreground && viewing(tag))) unread.update { it + 1 }
+                if (!AppState.foreground) {
+                    Notifier.message(app, displayName(), n, when (kind) {
+                        KIND_IMAGE -> "📷 Photo"
+                        KIND_VIDEO -> "🎬 Video"
+                        else -> "🎤 Voice note"
+                    })
+                }
+                if (kind != KIND_VOICE) scheduleSave()
+            } catch (e: Exception) {
+                setProgress(id, -1f)
+            } finally {
+                a.file?.delete()
+            }
+        }
+    }
+
+    /** Items that stopped arriving for a minute are marked as failed. */
+    private fun sweepTransfers() {
+        val cutoff = System.currentTimeMillis() - 60_000
+        val dead = assemblies.filter { (_, a) -> !a.done && a.lastActivity < cutoff }
+        dead.forEach { (id, a) ->
+            if (assemblies.remove(id, a)) {
+                a.discard()
+                setProgress(id, -1f)
+            }
         }
     }
 
@@ -679,7 +953,7 @@ class CarriageSession(
         saveJob?.cancel()
         saveJob = scope.launch(Dispatchers.IO) {
             delay(1500)
-            store.save(tag, messages.value, settings.value.retentionDays)
+            store.save(tag, saveable(), settings.value.retentionDays)
         }
     }
 
@@ -690,8 +964,11 @@ class CarriageSession(
         private const val VOTE_FRESH_MS = 10 * 60_000L
         private const val MAX_BUNDLES = 10
         private const val CHUNK = 48 * 1024
-        private const val MAX_IMG = 3_000_000
-        private const val MAX_CHUNKS = 100
-        private const val MAX_ASSEMBLIES = 8
+        private const val MAX_MEDIA = 3_000_000
+        private const val MAX_ASSEMBLIES = 12
+        private const val MAX_VOICE_MEMORY = 40L * 1024 * 1024
+        private const val KIND_IMAGE = "image"
+        private const val KIND_VOICE = "voice"
+        private const val KIND_VIDEO = "video"
     }
 }

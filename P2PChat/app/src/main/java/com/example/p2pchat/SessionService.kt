@@ -11,6 +11,8 @@ import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.IBinder
 import android.os.PowerManager
+import android.media.AudioAttributes
+import android.net.Uri
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -28,7 +30,7 @@ object AppState {
 
 object Notifier {
     private const val CH_SESSION = "session"
-    private const val CH_MESSAGES = "messages"
+    const val CH_MESSAGES = "messages_whistle"   // new id: a channel's sound can't change once created
     private const val ID_MESSAGES = 2
     private var unread = 0
 
@@ -38,9 +40,18 @@ object Notifier {
             NotificationChannel(CH_SESSION, "Carriage connection", NotificationManager.IMPORTANCE_LOW).apply {
                 description = "Shown while BrassTalks keeps your carriages connected"
             })
+        runCatching { nm.deleteNotificationChannel("messages") }   // old channel without the whistle
+        val whistle = Uri.parse("android.resource://${ctx.packageName}/${R.raw.steam_whistle}")
         nm.createNotificationChannel(
             NotificationChannel(CH_MESSAGES, "Messages", NotificationManager.IMPORTANCE_DEFAULT).apply {
                 description = "New messages while the app is in the background"
+                setSound(
+                    whistle,
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
             })
     }
 
@@ -52,7 +63,7 @@ object Notifier {
 
     fun session(ctx: Context, text: String): Notification =
         NotificationCompat.Builder(ctx, CH_SESSION)
-            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setSmallIcon(R.drawable.ic_stat_brass)
             .setContentTitle("BrassTalks")
             .setContentText(text)
             .setContentIntent(openApp(ctx))
@@ -67,12 +78,12 @@ object Notifier {
         unread++
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val hidden = NotificationCompat.Builder(ctx, CH_MESSAGES)
-            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setSmallIcon(R.drawable.ic_stat_brass)
             .setContentTitle("BrassTalks")
             .setContentText("New message")
             .build()
         val n = NotificationCompat.Builder(ctx, CH_MESSAGES)
-            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setSmallIcon(R.drawable.ic_stat_brass)
             .setContentTitle(if (unread == 1) "$sender · $carriage" else "$unread new messages")
             .setContentText(if (unread == 1) text else "Latest from $sender")
             .setStyle(NotificationCompat.BigTextStyle().bigText(text))

@@ -271,6 +271,10 @@ class LanTransport(context: Context) : Transport {
         scope.launch { writeAll(enc) }
     }
 
+    override fun sendBlocking(frame: ByteArray) {
+        writeAll(Crypto.encrypt(ring[0].second, frame))
+    }
+
     override fun rekey(kid: String, key: SecretKey) {
         if (ring.any { it.first == kid }) return
         ring.add(0, kid to key)

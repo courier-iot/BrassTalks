@@ -4,7 +4,9 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
+import android.net.Uri
 import android.os.Build
+import android.provider.OpenableColumns
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
@@ -40,7 +42,11 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.content.ContentValues
 import android.provider.MediaStore
+import android.widget.MediaController
 import android.widget.Toast
+import android.widget.VideoView
+import androidx.compose.ui.viewinterop.AndroidView
+import java.io.File
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
@@ -50,6 +56,15 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.Dispatchers
+import android.content.res.Configuration
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
+import java.util.Calendar
+import java.util.Date
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -57,12 +72,20 @@ import kotlinx.coroutines.withContext
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
-            navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT)
-        )
         val vm = (application as BrassApp).chatVm()   // one brain for the whole app, kept alive by the service
+        // Pick the colours before the first frame so there's no flash of the wrong theme
+        val systemDark = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        val startDark = when (vm.settings.value.theme) { "light" -> false; "system" -> systemDark; else -> true }
+        Steam.apply(startDark)
+        applyBars(startDark)
         setContent {
+            val settings by vm.settings.collectAsStateWithLifecycle()
+            val sysDark = isSystemInDarkTheme()
+            val dark = when (settings.theme) { "light" -> false; "system" -> sysDark; else -> true }
+            LaunchedEffect(dark) {
+                Steam.apply(dark)
+                applyBars(dark)
+            }
             SteampunkTheme {
                 Box(Modifier.fillMaxSize().background(Steam.Backdrop)) {
                     Surface(
@@ -75,6 +98,13 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /** Light or dark status/navigation bar icons to match the theme. */
+    private fun applyBars(dark: Boolean) {
+        val style = if (dark) SystemBarStyle.dark(AndroidColor.TRANSPARENT)
+                    else SystemBarStyle.light(AndroidColor.TRANSPARENT, AndroidColor.TRANSPARENT)
+        enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
     }
 
     override fun onStart() {
@@ -183,7 +213,10 @@ fun SettingRow(title: String, subtitle: String, checked: Boolean, onChange: (Boo
 }
 
 @Composable
-fun SettingsDialog(s: AppSettings, onChange: (AppSettings) -> Unit, onErase: () -> Unit, onClose: () -> Unit) {
+fun SettingsDialog(
+    s: AppSettings, onChange: (AppSettings) -> Unit, onErase: () -> Unit, onClose: () -> Unit,
+    alias: String? = null, serial: String? = null
+) {
     var confirmErase by remember { mutableStateOf(false) }
     val ctx = LocalContext.current
     AlertDialog(
@@ -192,6 +225,29 @@ fun SettingsDialog(s: AppSettings, onChange: (AppSettings) -> Unit, onErase: () 
         title = { Text("Settings") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                if (alias != null) {
+                    Column {
+                        Text("Your alias: $alias", fontWeight = FontWeight.Bold)
+                        Text("Chosen at first launch and permanent for this install." +
+                                (serial?.let { " Serial ${it.take(8).uppercase()}." } ?: ""),
+                            style = MaterialTheme.typography.bodySmall, color = Steam.ParchmentDim)
+                    }
+                }
+                Text("Appearance", fontWeight = FontWeight.Bold)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("dark" to "Brass", "light" to "Parchment", "system" to "Match phone").forEach { (key, label) ->
+                        FilterChip(
+                            selected = s.theme == key,
+                            onClick = { onChange(s.copy(theme = key)) },
+                            label = { Text(label) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = Steam.CopperDark,
+                                selectedLabelColor = Steam.Parchment,
+                                labelColor = Steam.ParchmentDim
+                            )
+                        )
+                    }
+                }
                 SettingRow("Save chat history", "Stored encrypted on this phone only.", s.keepHistory) {
                     onChange(s.copy(keepHistory = it))
                 }
@@ -215,8 +271,26 @@ fun SettingsDialog(s: AppSettings, onChange: (AppSettings) -> Unit, onErase: () 
                 SettingRow("Keep photos", "When off, photos are deleted when you leave a carriage or restart the app.", s.keepImages) {
                     onChange(s.copy(keepImages = it))
                 }
-                SettingRow("Keep received videos", "Takes effect once video sharing is added.", s.keepVideos) {
+                SettingRow("Keep videos", "When off, videos are deleted when you leave a carriage or restart the app.", s.keepVideos) {
                     onChange(s.copy(keepVideos = it))
+                }
+                Text("Default quality for photos and videos", fontWeight = FontWeight.Bold)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Quality.presets.forEach { q ->
+                        FilterChip(
+                            selected = s.quality == q.key,
+                            onClick = { onChange(s.copy(quality = q.key)) },
+                            label = { Text(q.label) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = Steam.CopperDark,
+                                selectedLabelColor = Steam.Parchment,
+                                labelColor = Steam.ParchmentDim
+                            )
+                        )
+                    }
+                }
+                SettingRow("Ask quality each time", "Choose quality (or Original for photos) before every send.", s.askQuality) {
+                    onChange(s.copy(askQuality = it))
                 }
                 SettingRow(
                     "Stay connected in background",
@@ -236,6 +310,21 @@ fun SettingsDialog(s: AppSettings, onChange: (AppSettings) -> Unit, onErase: () 
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("Battery settings: set BrassTalks to Unrestricted") }
                 }
+                OutlinedButton(
+                    onClick = {
+                        runCatching {
+                            ctx.startActivity(
+                                Intent(android.provider.Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                                    .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+                                    .putExtra(android.provider.Settings.EXTRA_CHANNEL_ID, Notifier.CH_MESSAGES)
+                            )
+                        }
+                    },
+                    shape = RoundedCornerShape(4.dp),
+                    border = BorderStroke(1.dp, Steam.Copper),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Steam.Copper),
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Message alert sound (steam whistle)") }
                 Text("Voice memos are never saved. They disappear when you leave a carriage.",
                     style = MaterialTheme.typography.bodySmall, color = Steam.ParchmentDim)
                 OutlinedButton(
@@ -263,7 +352,8 @@ fun SettingsDialog(s: AppSettings, onChange: (AppSettings) -> Unit, onErase: () 
 @Composable
 fun SettingsHost(vm: ChatViewModel, onClose: () -> Unit) {
     val s by vm.settings.collectAsStateWithLifecycle()
-    SettingsDialog(s, { vm.updateSettings(it) }, { vm.eraseAllHistory() }, onClose)
+    val alias by vm.profileName.collectAsStateWithLifecycle()
+    SettingsDialog(s, { vm.updateSettings(it) }, { vm.eraseAllHistory() }, onClose, alias, vm.myId)
 }
 
 fun buildMembers(
@@ -501,6 +591,8 @@ fun MembersDialog(
     vm: CarriageSession, members: List<Member>, votes: Map<String, VoteInfo>,
     iAmHost: Boolean, onClose: () -> Unit
 ) {
+    val nicks by vm.people.nicknames.collectAsStateWithLifecycle()
+    var nickTarget by remember { mutableStateOf<Member?>(null) }
     var kickTarget by remember { mutableStateOf<Member?>(null) }
     var voteTarget by remember { mutableStateOf<Member?>(null) }
 
@@ -519,15 +611,17 @@ fun MembersDialog(
                 members.forEach { m ->
                     Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
+                            val nick = if (m.isMe) null else nicks[m.id]
                             Text(
                                 buildString {
-                                    append(m.name)
+                                    append(nick ?: m.name)
                                     if (m.isMe) append(" (you)")
-                                    if (m.isHost) append("  ★ Host")
+                                    if (m.isHost) append("  \u2605 Host")
                                 },
                                 fontWeight = FontWeight.Bold
                             )
-                            Text(m.id.take(8).uppercase(), style = MaterialTheme.typography.labelSmall,
+                            Text((if (nick != null) "${m.name} · " else "") + m.id.take(8).uppercase(),
+                                style = MaterialTheme.typography.labelSmall,
                                 color = Steam.Copper, fontFamily = FontFamily.Monospace)
                             val v = votes[m.id]
                             if (v != null) {
@@ -536,6 +630,7 @@ fun MembersDialog(
                             }
                         }
                         if (!m.isMe) {
+                            TextButton(onClick = { nickTarget = m }) { Text("Nickname", color = Steam.Brass) }
                             if (iAmHost) {
                                 TextButton(onClick = { kickTarget = m }) { Text("Remove", color = Steam.Rust) }
                             } else if (!m.isHost) {
@@ -550,6 +645,11 @@ fun MembersDialog(
         confirmButton = { TextButton(onClick = onClose) { Text("Close", color = Steam.Brass) } }
     )
 
+    val nt = nickTarget
+    if (nt != null) {
+        NicknameDialog(alias = nt.name, current = nicks[nt.id] ?: "",
+            onSave = { vm.people.setNickname(nt.id, it); nickTarget = null }, onClose = { nickTarget = null })
+    }
     val kt = kickTarget
     if (kt != null) {
         AlertDialog(
@@ -576,6 +676,7 @@ fun MembersDialog(
 
 // ---------- Chat (one carriage) ----------
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ChatScreen(vm: CarriageSession, onOpenMenu: () -> Unit, onOpenSettings: () -> Unit) {
     val room by vm.room.collectAsStateWithLifecycle()
@@ -587,6 +688,8 @@ fun ChatScreen(vm: CarriageSession, onOpenMenu: () -> Unit, onOpenSettings: () -
     val votes by vm.votes.collectAsStateWithLifecycle()
     val settings by vm.settings.collectAsStateWithLifecycle()
     val nickname by vm.nickname.collectAsStateWithLifecycle()
+    val transfers by vm.transfers.collectAsStateWithLifecycle()
+    val preparing by vm.preparing.collectAsStateWithLifecycle()
 
     var input by remember { mutableStateOf("") }
     var confirmLeave by remember { mutableStateOf(false) }
@@ -597,12 +700,60 @@ fun ChatScreen(vm: CarriageSession, onOpenMenu: () -> Unit, onOpenSettings: () -
     var skipped by remember { mutableStateOf(setOf<String>()) }
     var showRename by remember { mutableStateOf(false) }
     var openPhoto by remember { mutableStateOf<Msg?>(null) }
+    var openVideo by remember { mutableStateOf<Msg?>(null) }
+    var pendingMedia by remember { mutableStateOf<Pair<Uri, Boolean>?>(null) }   // (picked item, is it a video)
+    var replyingTo by remember { mutableStateOf<Msg?>(null) }
+    var menuFor by remember { mutableStateOf<String?>(null) }        // message whose long-press menu is open
+    var nickFor by remember { mutableStateOf<Pair<String, String>?>(null) }   // (person id, alias)
+    val nicks by vm.people.nicknames.collectAsStateWithLifecycle()
+    val clipboard = LocalClipboardManager.current
+    val scope = rememberCoroutineScope()
+    val ctx = LocalContext.current
+    val recorder = remember { VoiceRecorder(ctx) }
+    var recording by remember { mutableStateOf(false) }
+    var recMs by remember { mutableStateOf(0L) }
     val listState = rememberLazyListState()
     val fieldColors = steamFieldColors()
-    val ctx = LocalContext.current
 
     val photoPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        if (uri != null) vm.sendPhoto(uri)
+        if (uri != null) {
+            val isVideo = (ctx.contentResolver.getType(uri) ?: "").startsWith("video")
+            val q = Quality.of(vm.settings.value.quality)
+            when {
+                vm.settings.value.askQuality -> pendingMedia = uri to isVideo
+                isVideo -> vm.sendVideo(uri, q)
+                else -> vm.sendPhoto(uri, q)
+            }
+        }
+    }
+
+    fun startRecording() {
+        VoicePlayer.stop()
+        if (recorder.start()) { recording = true; recMs = 0L }
+        else Toast.makeText(ctx, "Couldn't start the microphone", Toast.LENGTH_SHORT).show()
+    }
+    fun finishRecording(send: Boolean) {
+        if (!recording) return
+        recording = false
+        if (send) {
+            val res = recorder.stop()
+            if (res != null) vm.sendVoice(res.first, res.second)
+            else Toast.makeText(ctx, "Too short. Tap the mic, speak, then tap Send.", Toast.LENGTH_SHORT).show()
+        } else recorder.cancel()
+    }
+    val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) startRecording()
+        else Toast.makeText(ctx, "BrassTalks needs the microphone to record voice notes.", Toast.LENGTH_LONG).show()
+    }
+    LaunchedEffect(recording) {
+        while (recording) {
+            recMs = recorder.elapsedMs()
+            if (recMs >= MAX_VOICE_MS) { finishRecording(true); break }
+            delay(200)
+        }
+    }
+    DisposableEffect(Unit) {
+        onDispose { recorder.cancel(); VoicePlayer.stop() }
     }
 
     val members = buildMembers(vm.myId, room.name, known, connected, hostId)
@@ -633,6 +784,25 @@ fun ChatScreen(vm: CarriageSession, onOpenMenu: () -> Unit, onOpenSettings: () -
     }
     val photo = openPhoto
     if (photo != null) PhotoViewer(vm, photo) { openPhoto = null }
+    val pm = pendingMedia
+    if (pm != null) {
+        QualityDialog(
+            uri = pm.first, isVideo = pm.second, others = peers,
+            default = Quality.of(settings.quality),
+            onSend = { q ->
+                pendingMedia = null
+                if (pm.second) vm.sendVideo(pm.first, q) else vm.sendPhoto(pm.first, q)
+            },
+            onClose = { pendingMedia = null }
+        )
+    }
+    val nf = nickFor
+    if (nf != null) {
+        NicknameDialog(alias = nf.second, current = nicks[nf.first] ?: "",
+            onSave = { vm.people.setNickname(nf.first, it); nickFor = null }, onClose = { nickFor = null })
+    }
+    val video = openVideo
+    if (video != null) VideoViewer(vm, video) { openVideo = null }
 
     if (confirmLeave) {
         AlertDialog(
@@ -736,53 +906,139 @@ fun ChatScreen(vm: CarriageSession, onOpenMenu: () -> Unit, onOpenSettings: () -
             verticalArrangement = Arrangement.spacedBy(8.dp),
             contentPadding = PaddingValues(vertical = 10.dp)
         ) {
-            items(messages, key = { it.id }) { m ->
+            itemsIndexed(messages, key = { _, m -> m.id }) { i, m ->
+                Column {
+                if (i == 0 || !sameDay(messages[i - 1].ts, m.ts)) DateChip(m.ts)
                 if (m.system) {
                     Text(m.text, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center,
                         style = MaterialTheme.typography.bodySmall, color = Steam.ParchmentDim,
                         fontStyle = FontStyle.Italic)
                 } else {
                     val mine = m.senderId == vm.myId
+                    val label = if (mine) m.senderName else (nicks[m.senderId] ?: m.senderName)
+                    val showMenu = { menuFor = m.id }
                     Row(
                         Modifier.fillMaxWidth(),
                         horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start
                     ) {
+                        Box {
                         Surface(
                             shape = RoundedCornerShape(6.dp),
                             color = if (mine) Steam.CopperDark else Steam.WoodLight,
                             contentColor = Steam.Parchment,
                             border = BorderStroke(1.dp, if (mine) Steam.Copper else Steam.Verdigris),
                             modifier = Modifier.widthIn(max = 300.dp)
+                                .combinedClickable(onClick = {}, onLongClick = showMenu)
                         ) {
                             Column(Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
-                                if (!mine) Text(m.senderName, style = MaterialTheme.typography.labelSmall,
-                                    color = Steam.Verdigris, fontWeight = FontWeight.Bold)
+                                if (!mine) {
+                                    Row(verticalAlignment = Alignment.Bottom) {
+                                        Text(label, style = MaterialTheme.typography.labelSmall,
+                                            color = Steam.Verdigris, fontWeight = FontWeight.Bold)
+                                        if (nicks[m.senderId] != null) {
+                                            Text(" · ${m.senderName}", style = MaterialTheme.typography.labelSmall,
+                                                color = Steam.ParchmentDim)
+                                        }
+                                    }
+                                }
+                                val re = m.replyTo
+                                if (re != null) {
+                                    val orig = messages.firstOrNull { it.id == re }
+                                    ReplyQuote(
+                                        who = orig?.let { o -> if (o.senderId == vm.myId) "You" else (nicks[o.senderId] ?: o.senderName) },
+                                        snippet = orig?.let { snippet(it) }
+                                    ) {
+                                        val idx = messages.indexOfFirst { it.id == re }
+                                        if (idx >= 0) scope.launch { listState.animateScrollToItem(idx) }
+                                    }
+                                }
                                 if (m.image != null) {
-                                    PhotoBubble(vm, m) { openPhoto = m }
+                                    PhotoBubble(vm, m, transfers[m.id], mine) { openPhoto = m }
+                                } else if (m.video != null) {
+                                    VideoBubble(vm, m, transfers[m.id], preparing[m.id], mine) { openVideo = m }
+                                } else if (m.voice != null) {
+                                    VoiceBubble(vm, m, transfers[m.id], mine)
                                 } else {
                                     Text(m.text)
                                 }
+                                Text(timeOf(ctx, m.ts), style = MaterialTheme.typography.labelSmall,
+                                    color = Steam.ParchmentDim, modifier = Modifier.align(Alignment.End))
                             }
                         }
+                        DropdownMenu(
+                            expanded = menuFor == m.id, onDismissRequest = { menuFor = null },
+                            modifier = Modifier.background(Steam.Wood)
+                        ) {
+                            DropdownMenuItem(text = { Text("Reply") }, onClick = {
+                                menuFor = null; replyingTo = m
+                            })
+                            if (m.text.isNotEmpty()) {
+                                DropdownMenuItem(text = { Text("Copy text") }, onClick = {
+                                    menuFor = null
+                                    clipboard.setText(AnnotatedString(m.text))
+                                    if (Build.VERSION.SDK_INT < 33) Toast.makeText(ctx, "Copied", Toast.LENGTH_SHORT).show()
+                                })
+                            }
+                            if (!mine) {
+                                DropdownMenuItem(
+                                    text = { Text(if (nicks[m.senderId] == null) "Give ${m.senderName} a nickname" else "Change nickname") },
+                                    onClick = { menuFor = null; nickFor = m.senderId to m.senderName }
+                                )
+                            }
+                        }
+                        }
                     }
+                }
                 }
             }
         }
 
         HorizontalDivider(color = Steam.Copper)
-        Row(
-            Modifier.fillMaxWidth().background(Steam.Wood).padding(8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            TextButton(onClick = {
-                photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-            }) { Text("\uD83D\uDCF7", fontSize = 22.sp) }
-            OutlinedTextField(
-                input, { input = it }, placeholder = { Text("Dispatch a message") },
-                colors = fieldColors, modifier = Modifier.weight(1f), maxLines = 4
-            )
-            Spacer(Modifier.width(8.dp))
-            BrassButton("Transmit", enabled = input.isNotBlank()) { vm.send(input); input = "" }
+        val rt = replyingTo
+        if (rt != null) {
+            Row(
+                Modifier.fillMaxWidth().background(Steam.Wood).padding(start = 12.dp, end = 4.dp, top = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("Replying to " + (if (rt.senderId == vm.myId) "yourself" else (nicks[rt.senderId] ?: rt.senderName)),
+                        style = MaterialTheme.typography.labelSmall, color = Steam.Brass, fontWeight = FontWeight.Bold)
+                    Text(snippet(rt), style = MaterialTheme.typography.bodySmall, color = Steam.ParchmentDim, maxLines = 1)
+                }
+                TextButton(onClick = { replyingTo = null }) { Text("\u2715", color = Steam.Copper) }
+            }
+        }
+        if (recording) {
+            Row(
+                Modifier.fillMaxWidth().background(Steam.Wood).padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                TextButton(onClick = { finishRecording(false) }) { Text("Cancel", color = Steam.Copper) }
+                Text("\u25CF", color = Steam.Rust, fontSize = 18.sp)
+                Spacer(Modifier.width(6.dp))
+                Text("Recording ${fmtDur(recMs)} / ${fmtDur(MAX_VOICE_MS)}", modifier = Modifier.weight(1f))
+                BrassButton("Send", enabled = true) { finishRecording(true) }
+            }
+        } else {
+            Row(
+                Modifier.fillMaxWidth().background(Steam.Wood).padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                TextButton(onClick = {
+                    photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+                }) { Text("\uD83D\uDCF7", fontSize = 22.sp) }
+                TextButton(onClick = {
+                    if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                        startRecording()
+                    } else micPermission.launch(Manifest.permission.RECORD_AUDIO)
+                }) { Text("\uD83C\uDFA4", fontSize = 22.sp) }
+                OutlinedTextField(
+                    input, { input = it }, placeholder = { Text("Dispatch a message") },
+                    colors = fieldColors, modifier = Modifier.weight(1f), maxLines = 4
+                )
+                Spacer(Modifier.width(8.dp))
+                BrassButton("Transmit", enabled = input.isNotBlank()) { vm.send(input, replyingTo?.id); input = ""; replyingTo = null }
+            }
         }
     }
 }
@@ -791,22 +1047,91 @@ fun ChatScreen(vm: CarriageSession, onOpenMenu: () -> Unit, onOpenSettings: () -
 // ---------- Photos ----------
 
 @Composable
-fun PhotoBubble(vm: CarriageSession, m: Msg, onClick: () -> Unit) {
-    val state by produceState<Pair<Boolean, ImageBitmap?>>(false to null, m.image) {
-        value = true to withContext(Dispatchers.IO) {
+fun TransferBar(p: Float?, mine: Boolean) {
+    if (p == null) return
+    Spacer(Modifier.height(4.dp))
+    if (p < 0f) {
+        Text(if (mine) "Not sent. Try again." else "Didn't arrive in full.",
+            style = MaterialTheme.typography.labelSmall, color = Steam.Rust)
+    } else {
+        LinearProgressIndicator(
+            progress = { p }, color = Steam.Brass, trackColor = Steam.Leather,
+            modifier = Modifier.width(160.dp)
+        )
+        Text((if (mine) "Sending " else "Receiving ") + "${(p * 100).toInt()}%",
+            style = MaterialTheme.typography.labelSmall, color = Steam.ParchmentDim)
+    }
+}
+
+@Composable
+fun PhotoBubble(vm: CarriageSession, m: Msg, progress: Float?, mine: Boolean, onClick: () -> Unit) {
+    // Incoming photos only exist once every piece has arrived, so reload when the transfer finishes
+    val arriving = !mine && progress != null
+    val state by produceState<Pair<Boolean, ImageBitmap?>>(false to null, m.image, arriving) {
+        value = if (arriving) false to null else true to withContext(Dispatchers.IO) {
             vm.readImage(m)?.let { ImageUtil.decodeSampled(it, 700)?.asImageBitmap() }
         }
     }
     val (done, bmp) = state
-    if (bmp != null) {
-        Image(
-            bitmap = bmp, contentDescription = "Photo", contentScale = ContentScale.Fit,
-            modifier = Modifier.widthIn(max = 240.dp).heightIn(max = 320.dp)
-                .clickable(onClick = onClick)
-        )
-    } else {
-        Text(if (done) "Photo no longer available" else "Loading photo…",
-            style = MaterialTheme.typography.bodySmall, color = Steam.ParchmentDim, fontStyle = FontStyle.Italic)
+    Column {
+        if (bmp != null) {
+            Image(
+                bitmap = bmp, contentDescription = "Photo", contentScale = ContentScale.Fit,
+                modifier = Modifier.widthIn(max = 240.dp).heightIn(max = 320.dp)
+                    .clickable(onClick = onClick)
+            )
+        } else {
+            Text(
+                when {
+                    arriving -> "\uD83D\uDCF7 Photo on its way"
+                    done -> "Photo no longer available"
+                    else -> "Loading photo…"
+                },
+                style = MaterialTheme.typography.bodySmall, color = Steam.ParchmentDim, fontStyle = FontStyle.Italic
+            )
+        }
+        TransferBar(progress, mine)
+    }
+}
+
+@Composable
+fun VoiceBubble(vm: CarriageSession, m: Msg, progress: Float?, mine: Boolean) {
+    val playing by VoicePlayer.playing.collectAsStateWithLifecycle()
+    val pos by VoicePlayer.position.collectAsStateWithLifecycle()
+    val ready = mine || progress == null
+    val isMe = playing == m.voice
+    val total = m.durMs.coerceAtLeast(1L)
+    Column(Modifier.width(220.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(
+                onClick = {
+                    val bytes = vm.readVoice(m)
+                    if (bytes != null) VoicePlayer.toggle(m.voice!!, bytes)
+                },
+                enabled = ready && (mine || progress == null),
+                shape = RoundedCornerShape(50),
+                border = BorderStroke(1.dp, Steam.Brass),
+                contentPadding = PaddingValues(0.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Steam.Brass),
+                modifier = Modifier.size(40.dp)
+            ) { Text(if (isMe) "\u25A0" else "\u25B6") }
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                LinearProgressIndicator(
+                    progress = { if (isMe) (pos.toFloat() / total).coerceIn(0f, 1f) else 0f },
+                    color = Steam.Verdigris, trackColor = Steam.Leather,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(4.dp))
+                Text("\uD83C\uDFA4 " + (if (isMe) "${fmtDur(pos)} / " else "") + fmtDur(m.durMs),
+                    style = MaterialTheme.typography.labelSmall, color = Steam.ParchmentDim)
+            }
+        }
+        TransferBar(progress, mine)
+        if (ready && vm.readVoice(m) == null) {
+            Text("Voice note expired (not kept after leaving or restarting)",
+                style = MaterialTheme.typography.labelSmall, color = Steam.ParchmentDim, fontStyle = FontStyle.Italic)
+        }
     }
 }
 
@@ -876,6 +1201,292 @@ fun RenameDialog(current: String, code: String, onSave: (String) -> Unit, onClos
                     modifier = Modifier.fillMaxWidth())
                 Spacer(Modifier.height(8.dp))
                 Text("Only you see this name. Others still see the code ($code). Leave it blank to use the code.",
+                    style = MaterialTheme.typography.bodySmall, color = Steam.ParchmentDim)
+            }
+        },
+        confirmButton = { TextButton(onClick = { onSave(text) }) { Text("Save", color = Steam.Brass) } },
+        dismissButton = { TextButton(onClick = onClose) { Text("Cancel", color = Steam.Copper) } }
+    )
+}
+
+
+// ---------- Videos ----------
+
+@Composable
+fun VideoBubble(vm: CarriageSession, m: Msg, progress: Float?, preparing: Float?, mine: Boolean, onClick: () -> Unit) {
+    val arriving = !mine && progress != null
+    val thumb by produceState<ImageBitmap?>(null, m.video, arriving) {
+        value = withContext(Dispatchers.IO) {
+            vm.readThumb(m)?.let { ImageUtil.decodeSampled(it, 480)?.asImageBitmap() }
+        }
+    }
+    val playable by produceState(false, m.video, progress, preparing) {
+        value = preparing == null && (mine || progress == null) && withContext(Dispatchers.IO) { vm.hasVideo(m) }
+    }
+    Column {
+        Box(
+            Modifier.widthIn(max = 240.dp)
+                .then(if (playable) Modifier.clickable(onClick = onClick) else Modifier),
+            contentAlignment = Alignment.Center
+        ) {
+            val t = thumb
+            if (t != null) {
+                Image(bitmap = t, contentDescription = "Video", contentScale = ContentScale.Fit,
+                    modifier = Modifier.widthIn(max = 240.dp).heightIn(max = 320.dp))
+            } else {
+                Box(Modifier.size(200.dp, 120.dp).background(Steam.Leather))
+            }
+            Surface(shape = RoundedCornerShape(50), color = Steam.Leather.copy(alpha = 0.75f)) {
+                Text(if (playable) "\u25B6" else "\u23F3", color = Steam.Brass, fontSize = 24.sp,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp))
+            }
+        }
+        Text("\uD83C\uDFAC " + fmtDur(m.durMs), style = MaterialTheme.typography.labelSmall, color = Steam.ParchmentDim)
+        if (preparing != null) {
+            Spacer(Modifier.height(4.dp))
+            LinearProgressIndicator(
+                progress = { preparing }, color = Steam.Copper, trackColor = Steam.Leather,
+                modifier = Modifier.width(160.dp)
+            )
+            Text("Preparing ${(preparing * 100).toInt()}% (shrinking to send)",
+                style = MaterialTheme.typography.labelSmall, color = Steam.ParchmentDim)
+        }
+        TransferBar(progress, mine)
+        if (!playable && preparing == null && progress == null) {
+            Text("Video no longer available", style = MaterialTheme.typography.labelSmall,
+                color = Steam.ParchmentDim, fontStyle = FontStyle.Italic)
+        }
+    }
+}
+
+@Composable
+fun VideoViewer(vm: CarriageSession, m: Msg, onClose: () -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    // The stored copy is encrypted; a temporary private copy is made for playing and deleted on close
+    val tmp = remember { File(ctx.cacheDir, "play_${m.id}.mp4") }
+    val ready by produceState<Boolean?>(null, m.video) {
+        value = withContext(Dispatchers.IO) { vm.exportVideo(m, tmp) }
+    }
+    DisposableEffect(Unit) { onDispose { tmp.delete() } }
+
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Box(Modifier.fillMaxSize().background(Color.Black).safeDrawingPadding()) {
+            when (ready) {
+                null -> CircularProgressIndicator(color = Steam.Brass, modifier = Modifier.align(Alignment.Center))
+                false -> Text("Video no longer available", color = Steam.Parchment,
+                    modifier = Modifier.align(Alignment.Center))
+                true -> AndroidView(
+                    factory = { c ->
+                        VideoView(c).apply {
+                            val controls = MediaController(c)
+                            controls.setAnchorView(this)
+                            setMediaController(controls)
+                            setVideoPath(tmp.absolutePath)
+                            setOnPreparedListener { start() }
+                        }
+                    },
+                    onRelease = { it.stopPlayback() },
+                    modifier = Modifier.fillMaxWidth().align(Alignment.Center)
+                )
+            }
+            Text(m.senderName, color = Steam.ParchmentDim, style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.align(Alignment.BottomStart).padding(16.dp))
+            Row(Modifier.align(Alignment.TopEnd).padding(8.dp)) {
+                if (Build.VERSION.SDK_INT >= 29 && ready == true) {
+                    TextButton(onClick = {
+                        scope.launch(Dispatchers.IO) {
+                            val saved = saveVideo(ctx, vm, m)
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(ctx, if (saved) "Saved to Movies/BrassTalks" else "Couldn't save", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }) { Text("Save", color = Steam.Brass) }
+                }
+                TextButton(onClick = onClose) { Text("Close", color = Steam.Brass) }
+            }
+        }
+    }
+}
+
+private fun saveVideo(ctx: android.content.Context, vm: CarriageSession, m: Msg): Boolean {
+    if (Build.VERSION.SDK_INT < 29) return false
+    return try {
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, "BrassTalks_${System.currentTimeMillis()}.mp4")
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/BrassTalks")
+        }
+        val uri = ctx.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return false
+        val ok = ctx.contentResolver.openOutputStream(uri)?.use { vm.copyVideo(m, it) } ?: false
+        if (!ok) ctx.contentResolver.delete(uri, null, null)
+        ok
+    } catch (e: Exception) { false }
+}
+
+
+// ---------- Quality chooser ----------
+
+private fun fileSize(ctx: android.content.Context, uri: Uri): Long? = try {
+    ctx.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { c ->
+        if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null
+    }
+} catch (e: Exception) { null }
+
+@Composable
+fun QualityDialog(
+    uri: Uri, isVideo: Boolean, others: Int, default: Quality,
+    onSend: (Quality) -> Unit, onClose: () -> Unit
+) {
+    val ctx = LocalContext.current
+    var choice by remember { mutableStateOf(default) }
+    // Videos: length in ms. Photos: size of the original file in bytes.
+    val info by produceState<Long?>(null, uri) {
+        value = withContext(Dispatchers.IO) {
+            if (isVideo) VideoUtil.durationMs(ctx, uri) else fileSize(ctx, uri)
+        }
+    }
+    val options = if (isVideo) Quality.presets else Quality.presets + Quality.ORIGINAL
+    fun sizeOf(q: Quality): Long? = when {
+        isVideo -> info?.let { videoEstimateBytes(q, it) }
+        q == Quality.ORIGINAL -> info
+        else -> q.photoEstimate
+    }
+    val tooLong = isVideo && (info ?: 0L) > MAX_VIDEO_MS + 999
+    val tooBig = !isVideo && choice == Quality.ORIGINAL && (info ?: 0L) > ImageUtil.MAX_ORIGINAL
+
+    AlertDialog(
+        onDismissRequest = onClose,
+        containerColor = Steam.Wood, titleContentColor = Steam.Brass, textContentColor = Steam.Parchment,
+        title = { Text(if (isVideo) "Send video" else "Send photo") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                if (isVideo && info != null) {
+                    Text("Length ${fmtDur(info!!)}", style = MaterialTheme.typography.bodySmall, color = Steam.ParchmentDim)
+                    Spacer(Modifier.height(4.dp))
+                }
+                options.forEach { q ->
+                    val size = sizeOf(q)
+                    Row(
+                        Modifier.fillMaxWidth().clickable { choice = q }.padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = choice == q, onClick = { choice = q },
+                            colors = RadioButtonDefaults.colors(selectedColor = Steam.Brass, unselectedColor = Steam.Copper)
+                        )
+                        Column {
+                            Text(q.label + (size?.let { " · ≈ " + fmtSize(it) } ?: ""), fontWeight = FontWeight.Bold)
+                            Text(if (isVideo) q.videoDesc else q.photoDesc,
+                                style = MaterialTheme.typography.bodySmall, color = Steam.ParchmentDim)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                val per = sizeOf(choice)
+                if (per != null && others > 0) {
+                    Text("Each of the $others others aboard gets their own copy: about ${fmtSize(per * others)} sent in total.",
+                        style = MaterialTheme.typography.bodySmall, color = Steam.ParchmentDim)
+                }
+                if (choice == Quality.ORIGINAL) {
+                    Spacer(Modifier.height(4.dp))
+                    Text("Location and camera serial numbers are removed. HEIC, PNG and other formats are sent as a full-size JPEG so every phone can open them.",
+                        style = MaterialTheme.typography.bodySmall, color = Steam.ParchmentDim)
+                }
+                if (isVideo) {
+                    Spacer(Modifier.height(4.dp))
+                    Text("Original-quality video is coming later as tap-to-download.",
+                        style = MaterialTheme.typography.bodySmall, color = Steam.ParchmentDim, fontStyle = FontStyle.Italic)
+                }
+                if (tooLong) {
+                    Spacer(Modifier.height(4.dp))
+                    Text("Videos can be up to 5 minutes long.", color = Steam.Rust, style = MaterialTheme.typography.bodySmall)
+                }
+                if (tooBig) {
+                    Spacer(Modifier.height(4.dp))
+                    Text("This photo is over 25 MB. Choose High instead.", color = Steam.Rust, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSend(choice) }, enabled = !tooLong && !tooBig) {
+                Text("Send", color = if (tooLong || tooBig) Steam.ParchmentDim else Steam.Brass)
+            }
+        },
+        dismissButton = { TextButton(onClick = onClose) { Text("Cancel", color = Steam.Copper) } }
+    )
+}
+
+
+// ---------- Timestamps, replies, nicknames ----------
+
+private fun sameDay(a: Long, b: Long): Boolean {
+    val ca = Calendar.getInstance().apply { timeInMillis = a }
+    val cb = Calendar.getInstance().apply { timeInMillis = b }
+    return ca.get(Calendar.YEAR) == cb.get(Calendar.YEAR) && ca.get(Calendar.DAY_OF_YEAR) == cb.get(Calendar.DAY_OF_YEAR)
+}
+
+/** Time in the phone's own 12/24-hour style. */
+private fun timeOf(ctx: android.content.Context, ts: Long): String =
+    android.text.format.DateFormat.getTimeFormat(ctx).format(Date(ts))
+
+@Composable
+fun DateChip(ts: Long) {
+    val now = System.currentTimeMillis()
+    val label = when {
+        sameDay(ts, now) -> "Today"
+        sameDay(ts, now - 86_400_000L) -> "Yesterday"
+        else -> android.text.format.DateFormat.format("EEE, MMM d, yyyy", Date(ts)).toString()
+    }
+    Box(Modifier.fillMaxWidth().padding(vertical = 6.dp), contentAlignment = Alignment.Center) {
+        Surface(shape = RoundedCornerShape(50), color = Steam.Wood, border = BorderStroke(1.dp, Steam.CopperDark)) {
+            Text(label, modifier = Modifier.padding(horizontal = 12.dp, vertical = 3.dp),
+                style = MaterialTheme.typography.labelSmall, color = Steam.ParchmentDim)
+        }
+    }
+}
+
+/** Short description of a message, for reply quotes. */
+fun snippet(m: Msg): String = when {
+    m.image != null -> "\uD83D\uDCF7 Photo"
+    m.video != null -> "\uD83C\uDFAC Video"
+    m.voice != null -> "\uD83C\uDFA4 Voice note"
+    else -> m.text.replace('\n', ' ').take(100)
+}
+
+@Composable
+fun ReplyQuote(who: String?, snippet: String?, onClick: () -> Unit) {
+    Row(
+        Modifier.padding(bottom = 4.dp).background(Steam.Leather.copy(alpha = 0.35f), RoundedCornerShape(4.dp))
+            .clickable(onClick = onClick).height(IntrinsicSize.Min)
+    ) {
+        Box(Modifier.width(3.dp).fillMaxHeight().background(Steam.Brass))
+        Column(Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
+            if (who == null) {
+                Text("Original message not available", style = MaterialTheme.typography.labelSmall,
+                    color = Steam.ParchmentDim, fontStyle = FontStyle.Italic)
+            } else {
+                Text(who, style = MaterialTheme.typography.labelSmall, color = Steam.Brass, fontWeight = FontWeight.Bold)
+                Text(snippet ?: "", style = MaterialTheme.typography.bodySmall, color = Steam.ParchmentDim, maxLines = 2)
+            }
+        }
+    }
+}
+
+@Composable
+fun NicknameDialog(alias: String, current: String, onSave: (String) -> Unit, onClose: () -> Unit) {
+    var text by remember { mutableStateOf(current) }
+    AlertDialog(
+        onDismissRequest = onClose,
+        containerColor = Steam.Wood, titleContentColor = Steam.Brass, textContentColor = Steam.Parchment,
+        title = { Text("Nickname for $alias") },
+        text = {
+            Column {
+                OutlinedTextField(text, { text = it.take(24) }, singleLine = true,
+                    label = { Text("Your name for them") }, colors = steamFieldColors(),
+                    modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(8.dp))
+                Text("Only you see this, in every carriage you share with them. Their own alias ($alias) stays the same. Leave blank to remove.",
                     style = MaterialTheme.typography.bodySmall, color = Steam.ParchmentDim)
             }
         },

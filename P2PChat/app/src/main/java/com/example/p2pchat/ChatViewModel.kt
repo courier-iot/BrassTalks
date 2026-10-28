@@ -17,6 +17,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val prefs = Identity.securePrefs(app)
     private val store = HistoryStore(app)
     private val vault = PhotoVault(app)
+    /** Nicknames you give people, and everyone's permanent alias. */
+    val people = PeopleBook(prefs)
     val myId: String = Identity.deviceId()
     private val myPub: ByteArray = Identity.publicKeyBytes()
     private val ecdh = Identity.ecdhKeys(prefs)
@@ -37,7 +39,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------- Profile ----------
 
+    /** Your alias is chosen once, at first launch, and is permanent for this install. */
     fun setProfileName(name: String) {
+        if (profileName.value != null) return
         val n = name.trim().take(24)
         if (n.isEmpty()) return
         prefs.edit().putString("profile_name", n).apply()
@@ -48,7 +52,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun makeSession(r: RoomInfo) = CarriageSession(
         app = getApplication(), scope = viewModelScope, prefs = prefs, store = store,
-        vault = vault, myId = myId, myPub = myPub, ecdh = ecdh, settings = settings, initial = r,
+        vault = vault, people = people, myId = myId, myPub = myPub, ecdh = ecdh, settings = settings, initial = r,
         onChanged = { persist(); refreshStatus() },
         onNotice = { notice.value = it },
         onLeft = { removeSession(it) },

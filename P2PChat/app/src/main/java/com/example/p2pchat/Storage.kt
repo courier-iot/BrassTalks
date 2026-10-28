@@ -15,9 +15,12 @@ import java.io.File
 data class AppSettings(
     val keepHistory: Boolean = true,
     val retentionDays: Int = 0,      // 0 = keep forever
-    val keepImages: Boolean = true,  // used once photo sharing is added
-    val keepVideos: Boolean = true,  // used once video sharing is added
-    val keepAlive: Boolean = true    // foreground service: stay connected with the screen off
+    val keepImages: Boolean = true,
+    val keepVideos: Boolean = true,
+    val keepAlive: Boolean = true,   // foreground service: stay connected with the screen off
+    val quality: String = "standard", // default sending quality for photos and videos (a Quality key)
+    val askQuality: Boolean = true,   // show the quality chooser every time
+    val theme: String = "dark"        // "dark" (brass), "light" (parchment) or "system"
 )
 
 object SettingsStore {
@@ -26,12 +29,17 @@ object SettingsStore {
         retentionDays = p.getInt("s_days", 0),
         keepImages = p.getBoolean("s_img", true),
         keepVideos = p.getBoolean("s_vid", true),
-        keepAlive = p.getBoolean("s_keep", true)
+        keepAlive = p.getBoolean("s_keep", true),
+        quality = p.getString("s_q", "standard") ?: "standard",
+        askQuality = p.getBoolean("s_ask", true),
+        theme = p.getString("s_theme", "dark") ?: "dark"
     )
 
     fun save(p: SharedPreferences, s: AppSettings) {
         p.edit().putBoolean("s_hist", s.keepHistory).putInt("s_days", s.retentionDays)
-            .putBoolean("s_img", s.keepImages).putBoolean("s_vid", s.keepVideos).putBoolean("s_keep", s.keepAlive).apply()
+            .putBoolean("s_img", s.keepImages).putBoolean("s_vid", s.keepVideos).putBoolean("s_keep", s.keepAlive)
+            .putString("s_q", s.quality).putBoolean("s_ask", s.askQuality)
+            .putString("s_theme", s.theme).apply()
     }
 }
 
@@ -55,7 +63,8 @@ class HistoryStore(context: Context) {
         msgs.filter { it.ts >= limit }.forEach { m ->
             arr.put(JSONObject().put("id", m.id).put("sid", m.senderId).put("n", m.senderName)
                 .put("text", m.text).put("ts", m.ts).put("sys", m.system)
-                .put("img", m.image ?: "").put("w", m.imgW).put("h", m.imgH))
+                .put("img", m.image ?: "").put("w", m.imgW).put("h", m.imgH)
+                .put("vid", m.video ?: "").put("dur", m.durMs).put("re", m.replyTo ?: ""))
         }
         val f = file(tag)
         f.delete() // EncryptedFile refuses to overwrite
@@ -73,7 +82,9 @@ class HistoryStore(context: Context) {
             (0 until arr.length()).map { arr.getJSONObject(it) }.map {
                 Msg(it.getString("id"), it.getString("sid"), it.getString("n"),
                     it.getString("text"), it.getLong("ts"), it.optBoolean("sys", false),
-                    it.optString("img", "").ifEmpty { null }, it.optInt("w", 0), it.optInt("h", 0))
+                    it.optString("img", "").ifEmpty { null }, it.optInt("w", 0), it.optInt("h", 0),
+                    durMs = it.optLong("dur", 0L), video = it.optString("vid", "").ifEmpty { null },
+                    replyTo = it.optString("re", "").ifEmpty { null })
             }.filter { it.ts >= limit }
         } catch (e: Exception) { emptyList() }
     }
