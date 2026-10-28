@@ -33,24 +33,3 @@ jobs:
       - name: Fetch Victorian font
         run: |
           mkdir -p app/src/main/res/font app/src/main/assets/licenses
-          base=https://github.com/google/fonts/raw/main/ofl/cinzeldecorative
-          curl -fsSL -o app/src/main/res/font/cinzel_decorative.ttf      "$base/CinzelDecorative-Regular.ttf"
-          curl -fsSL -o app/src/main/res/font/cinzel_decorative_bold.ttf "$base/CinzelDecorative-Bold.ttf"
-          curl -fsSL -o app/src/main/assets/licenses/CinzelDecorative-OFL.txt "$base/OFL.txt"
-
-      - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
-
-      - name: Rename APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk BrassTalks.apk
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: P2PChat-apk
-          path: P2PChat/BrassTalks.apk
-
-      - name: Attach APK to release (tags only)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: P2PChat/BrassTalks.apk
