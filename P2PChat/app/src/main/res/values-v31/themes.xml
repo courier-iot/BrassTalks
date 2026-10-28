@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Android 12+ splash screen: the brass gear on dark leather -->
+    <style name="Theme.BrassTalks" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/leather</item>
+        <item name="android:statusBarColor">@color/leather</item>
+        <item name="android:navigationBarColor">@color/leather</item>
+        <item name="android:windowSplashScreenBackground">@color/leather</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@color/wood</item>
+    </style>
+</resources>

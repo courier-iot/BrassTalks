@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark leather window while the app starts, so there's no white flash -->
+    <style name="Theme.BrassTalks" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/leather</item>
+        <item name="android:statusBarColor">@color/leather</item>
+        <item name="android:navigationBarColor">@color/leather</item>
+    </style>
+</resources>

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Single-colour version for Android 13+ themed icons -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFFFFFFF" android:fillType="evenOdd" android:pathData="M49.85,27.83 L51.07,21.13 L56.93,21.13 L58.15,27.83 L63.50,29.26 L67.89,24.07 L72.98,27.00 L70.68,33.41 L74.59,37.32 L81.00,35.02 L83.93,40.11 L78.74,44.50 L80.17,49.85 L86.87,51.07 L86.87,56.93 L80.17,58.15 L78.74,63.50 L83.93,67.89 L81.00,72.98 L74.59,70.68 L70.68,74.59 L72.98,81.00 L67.89,83.93 L63.50,78.74 L58.15,80.17 L56.93,86.87 L51.07,86.87 L49.85,80.17 L44.50,78.74 L40.11,83.93 L35.02,81.00 L37.32,74.59 L33.41,70.68 L27.00,72.98 L24.07,67.89 L29.26,63.50 L27.83,58.15 L21.13,56.93 L21.13,51.07 L27.83,49.85 L29.26,44.50 L24.07,40.11 L27.00,35.02 L33.41,37.32 L37.32,33.41 L35.02,27.00 L40.11,24.07 L44.50,29.26 Z M36.50,54.00 A17.5,17.5 0 1,0 71.50,54.00 A17.5,17.5 0 1,0 36.50,54.00 Z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M46,46 L62,46 A3,3 0 0,1 65,49 L65,56 A3,3 0 0,1 62,59 L53,59 L47,65 L48,59 L46,59 A3,3 0 0,1 43,56 L43,49 A3,3 0 0,1 46,46 Z" />
+</vector>

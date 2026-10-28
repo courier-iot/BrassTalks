@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Dark leather background with a copper ring and four brass rivets -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#2A1D13" android:pathData="M0,0 h108 v108 h-108 Z" />
+    <path android:fillColor="#00000000" android:strokeColor="#5A3A1A" android:strokeWidth="2"
+        android:pathData="M54,16 A38,38 0 1,0 54.01,16 Z" />
+    <path android:fillColor="#8E6B2A" android:pathData="M25,25 m-2,0 a2,2 0 1,0 4,0 a2,2 0 1,0 -4,0 M83,25 m-2,0 a2,2 0 1,0 4,0 a2,2 0 1,0 -4,0 M25,83 m-2,0 a2,2 0 1,0 4,0 a2,2 0 1,0 -4,0 M83,83 m-2,0 a2,2 0 1,0 4,0 a2,2 0 1,0 -4,0" />
+</vector>
